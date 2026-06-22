@@ -4,8 +4,8 @@ import { ACCESS_COOKIE, REFRESH_COOKIE, ACCESS_TTL_S, REFRESH_TTL_S, env } from 
 
 const baseOpts = {
   httpOnly: true,
-  secure: env.IS_PROD,
-  sameSite: 'Lax' as const,
+  secure: true,
+  sameSite: 'None' as const,
   path: '/',
 };
 
