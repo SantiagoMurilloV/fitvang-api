@@ -1,12 +1,13 @@
 import type { Context } from 'hono';
 import { setCookie, deleteCookie } from 'hono/cookie';
-import { ACCESS_COOKIE, REFRESH_COOKIE, ACCESS_TTL_S, REFRESH_TTL_S, env } from './env';
+import { ACCESS_COOKIE, REFRESH_COOKIE, ACCESS_TTL_S, REFRESH_TTL_S } from './env';
 
 const baseOpts = {
   httpOnly: true,
   secure: true,
-  sameSite: 'None' as const,
+  sameSite: 'Lax' as const,
   path: '/',
+  domain: '.fitvang.com',
 };
 
 export function setAuthCookies(c: Context, accessToken: string, refreshToken: string) {
