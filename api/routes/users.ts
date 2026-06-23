@@ -1,9 +1,9 @@
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import { z } from 'zod';
-import { eq, desc, ilike, or } from 'drizzle-orm';
+import { eq, desc, ilike, or, and } from 'drizzle-orm';
 import { db } from '../db/client';
-import { users, guardians, coaches } from '../db/schema';
+import { users, guardians, coaches, userPlans, planTypes, trainingTypes } from '../db/schema';
 import { hashPassword, randomToken } from '../lib/password';
 import { requireAuth } from '../middleware/jwt';
 import { requireAdmin, requireStaff, checkSelf } from '../middleware/rbac';
@@ -201,6 +201,7 @@ usersRouter.get('/:id/ficha', async (c) => {
       nombre: users.nombreCompleto,
       email: users.email,
       telefono: users.telefono,
+      documento: users.documento,
       avatarUrl: users.avatarUrl,
       fechaNacimiento: users.fechaNacimiento,
       genero: users.genero,
@@ -209,13 +210,35 @@ usersRouter.get('/:id/ficha', async (c) => {
       alturaCm: users.alturaCm,
       bio: users.bio,
       activo: users.activo,
+      rol: users.rol,
       createdAt: users.createdAt,
     })
     .from(users)
     .where(eq(users.id, id))
     .limit(1);
   if (!rows[0]) return c.json({ error: 'not_found' }, 404);
-  return c.json({ user: rows[0] });
+
+  // Plan activo del usuario
+  const planRows = await db
+    .select({
+      id: userPlans.id,
+      planNombre: planTypes.nombre,
+      trainingNombre: trainingTypes.nombre,
+      trainingColor: trainingTypes.colorHex,
+      modalidad: planTypes.modalidad,
+      precioCopAplicado: userPlans.precioCopAplicado,
+      fechaInicio: userPlans.fechaInicio,
+      fechaFin: userPlans.fechaFin,
+      estado: userPlans.estado,
+    })
+    .from(userPlans)
+    .innerJoin(planTypes, eq(userPlans.planTypeId, planTypes.id))
+    .innerJoin(trainingTypes, eq(planTypes.trainingTypeId, trainingTypes.id))
+    .where(and(eq(userPlans.userId, id), eq(userPlans.estado, 'activo')))
+    .orderBy(desc(userPlans.fechaInicio))
+    .limit(1);
+
+  return c.json({ user: rows[0], planActivo: planRows[0] ?? null });
 });
 
 // Acudientes del menor
