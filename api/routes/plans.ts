@@ -59,6 +59,11 @@ plansRouter.patch('/types/:id', requireAdmin, zValidator('json', planTypeSchema.
   return c.json({ ok: true });
 });
 
+plansRouter.delete('/types/:id', requireAdmin, async (c) => {
+  await db.update(planTypes).set({ activo: false }).where(eq(planTypes.id, c.req.param('id')));
+  return c.json({ ok: true });
+});
+
 // Asignar plan a usuario
 const assignSchema = z.object({
   userId: z.string().uuid(),
