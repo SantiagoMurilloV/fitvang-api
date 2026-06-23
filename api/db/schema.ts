@@ -67,6 +67,7 @@ export const users = pgTable(
     fechaNacimiento: date('fecha_nacimiento'),
     genero: genderEnum('genero'),
     esMenor: boolean('es_menor').notNull().default(false),
+    esAcudiente: boolean('es_acudiente').notNull().default(false),
     pesoKg: numeric('peso_kg', { precision: 5, scale: 1 }),
     alturaCm: integer('altura_cm'),
     bio: text('bio'),
@@ -390,6 +391,20 @@ export const attendanceScoring = pgTable(
   })
 );
 
+export interface RolePermissions {
+  user: PermissionsForRole;
+  coach: PermissionsForRole;
+  menor: PermissionsForRole;
+  acudiente: PermissionsForRole;
+}
+
+export interface PermissionsForRole {
+  secciones: Record<string, boolean>;
+  acciones: Record<string, boolean>;
+  notificaciones: Record<string, boolean>;
+  limites: Record<string, number | null>;
+}
+
 export const clubConfig = pgTable('club_config', {
   id: integer('id').primaryKey().default(1),
   nombreClub: varchar('nombre_club', { length: 120 }).notNull().default('Fitvang'),
@@ -398,6 +413,7 @@ export const clubConfig = pgTable('club_config', {
   logoUrl: text('logo_url'),
   cancelacionHorasMin: integer('cancelacion_horas_min').notNull().default(2),
   wompiSandbox: boolean('wompi_sandbox').notNull().default(true),
+  permisos: jsonb('permisos').$type<RolePermissions>(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   // ck constraint para forzar singleton (id=1) lo manejamos en migración manual si se requiere
 });

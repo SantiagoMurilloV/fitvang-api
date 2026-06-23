@@ -43,6 +43,11 @@ function addMinutes(time: string, min: number): string {
 }
 
 classesRouter.get('/templates', async (c) => {
+  const me = c.get('user');
+  const coachIdParam = c.req.query('coachId');
+  // 'me' es un alias para el usuario autenticado
+  const filterCoachId = coachIdParam === 'me' ? me.sub : (coachIdParam ?? null);
+
   const rows = await db
     .select({
       id: classTemplates.id,
@@ -60,7 +65,11 @@ classesRouter.get('/templates', async (c) => {
     })
     .from(classTemplates)
     .innerJoin(trainingTypes, eq(classTemplates.trainingTypeId, trainingTypes.id))
-    .where(eq(classTemplates.activo, true))
+    .where(
+      filterCoachId
+        ? and(eq(classTemplates.activo, true), eq(classTemplates.coachId, filterCoachId))
+        : eq(classTemplates.activo, true)
+    )
     .orderBy(classTemplates.diaSemana, classTemplates.horaInicio);
 
   // Agregar planIds a cada template

@@ -15,15 +15,22 @@ import { loginLimit } from '../middleware/rateLimit';
 export const authRouter = new Hono();
 
 const loginSchema = z.object({
-  email: z.string().trim().email(),
+  email: z.string().trim().min(1),
   password: z.string().min(1),
 });
 
 authRouter.post('/login', loginLimit, zValidator('json', loginSchema), async (c) => {
 
   const { email, password } = c.req.valid('json');
-  const rows = await db.select().from(users).where(eq(users.email, email.toLowerCase())).limit(1);
-  const user = rows[0];
+  const identifier = email.toLowerCase().trim();
+  // Acepta email o teléfono como identificador
+  const rows = await db.select().from(users)
+    .where(eq(users.email, identifier))
+    .limit(1);
+  const byPhone = rows.length === 0
+    ? await db.select().from(users).where(eq(users.telefono, identifier)).limit(1)
+    : [];
+  const user = rows[0] ?? byPhone[0];
   if (!user || !user.activo) return c.json({ error: 'credenciales_invalidas' }, 401);
 
   const ok = await verifyPassword(password, user.passwordHash);
@@ -39,9 +46,13 @@ authRouter.post('/login', loginLimit, zValidator('json', loginSchema), async (c)
   });
 
   setAuthCookies(c, access, refresh);
+  const redirect = user.rol === 'super_admin' ? '/admin'
+    : user.rol === 'coach' ? '/coach'
+    : user.esAcudiente ? '/acudiente'
+    : '/app';
   return c.json({
-    user: { id: user.id, nombre: user.nombreCompleto, rol: user.rol, email: user.email },
-    redirect: user.rol === 'super_admin' ? '/admin' : user.rol === 'coach' ? '/coach' : '/app',
+    user: { id: user.id, nombre: user.nombreCompleto, rol: user.rol, email: user.email, esAcudiente: user.esAcudiente },
+    redirect,
   });
 });
 
@@ -102,6 +113,7 @@ authRouter.get('/me', requireAuth, async (c) => {
       rol: users.rol,
       avatarUrl: users.avatarUrl,
       esMenor: users.esMenor,
+      esAcudiente: users.esAcudiente,
     })
     .from(users)
     .where(eq(users.id, u.sub))

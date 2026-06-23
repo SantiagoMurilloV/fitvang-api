@@ -15,12 +15,13 @@ usersRouter.use('*', requireAuth);
 const createUserSchema = z.object({
   nombreCompleto: z.string().trim().min(2).max(120),
   documento: z.string().trim().min(3).max(30),
-  email: z.string().trim().email().max(150),
+  email: z.string().trim().email().max(150).optional(),
   telefono: z.string().trim().max(20).optional(),
   fechaNacimiento: z.string().optional(),
   genero: z.enum(['masculino', 'femenino', 'otro', 'prefiero_no_decir']).optional(),
   rol: z.enum(['super_admin', 'coach', 'user']).default('user'),
   esMenor: z.boolean().default(false),
+  esAcudiente: z.boolean().default(false),
   acudienteId: z.string().uuid().optional(),
   relacionAcudiente: z.enum(['padre', 'madre', 'tutor', 'otro']).optional(),
   password: z.string().min(6).max(128).optional(),
@@ -40,6 +41,7 @@ usersRouter.get('/', requireStaff, async (c) => {
       telefono: users.telefono,
       rol: users.rol,
       esMenor: users.esMenor,
+      esAcudiente: users.esAcudiente,
       activo: users.activo,
       avatarUrl: users.avatarUrl,
       createdAt: users.createdAt,
@@ -73,11 +75,12 @@ usersRouter.post('/', requireAdmin, zValidator('json', createUserSchema), async 
     .values({
       nombreCompleto: body.nombreCompleto,
       documento: body.documento,
-      email: body.email.toLowerCase(),
+      email: body.email?.toLowerCase() ?? `${body.documento}@fitvang.local`,
       telefono: body.telefono,
       passwordHash,
       rol: body.rol,
       esMenor: body.esMenor,
+      esAcudiente: body.esAcudiente,
       genero: body.genero,
       fechaNacimiento: body.fechaNacimiento,
       avatarUrl: body.avatarUrl,
@@ -106,7 +109,7 @@ usersRouter.post('/', requireAdmin, zValidator('json', createUserSchema), async 
   }, { tipo: 'bienvenida' });
 
   return c.json({
-    user: { id: u.id, email: body.email },
+    user: { id: u.id, email: body.email ?? null },
     passwordTemporal: body.password ? undefined : generated,
   });
 });
@@ -187,6 +190,15 @@ usersRouter.patch('/:id', requireAdmin, zValidator('json', updateSchema), async 
 // DEACTIVATE (soft)
 usersRouter.delete('/:id', requireAdmin, async (c) => {
   await db.update(users).set({ activo: false }).where(eq(users.id, c.req.param('id')));
+  return c.json({ ok: true });
+});
+
+// HARD DELETE (super_admin only) — elimina permanentemente
+usersRouter.delete('/:id/hard', requireAdmin, async (c) => {
+  const me = c.get('user');
+  const id = c.req.param('id');
+  if (me.sub === id) return c.json({ error: 'no_puedes_eliminarte' }, 400);
+  await db.delete(users).where(eq(users.id, id));
   return c.json({ ok: true });
 });
 

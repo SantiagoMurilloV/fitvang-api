@@ -14,6 +14,7 @@ import { notificationsRouter } from './routes/notifications';
 import { statsRouter } from './routes/stats';
 import { jobsRouter } from './routes/jobs';
 import { uploadRouter } from './routes/upload';
+import { configRouter } from './routes/config';
 import { globalLimit } from './middleware/rateLimit';
 import { db } from './db/client';
 import { sql } from 'drizzle-orm';
@@ -85,6 +86,7 @@ app.route('/notifications', notificationsRouter);
 app.route('/stats', statsRouter);
 app.route('/jobs', jobsRouter);
 app.route('/upload', uploadRouter);
+app.route('/config', configRouter);
 
 app.notFound((c) => c.json({ error: 'not_found', path: c.req.path }, 404));
 app.onError((err, c) => {

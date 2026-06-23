@@ -52,6 +52,47 @@ bookingsRouter.get('/me', async (c) => {
   return c.json({ bookings: rows });
 });
 
+// Reservas de un usuario — accesible por el propio usuario, su acudiente o admin/coach
+bookingsRouter.get('/user/:id', async (c) => {
+  const me = c.get('user');
+  const userId = c.req.param('id');
+  const isStaff = me.rol === 'super_admin' || me.rol === 'coach';
+  const isSelf = me.sub === userId;
+
+  if (!isStaff && !isSelf) {
+    // Verificar que el llamante es acudiente del menor
+    const { guardians } = await import('../db/schema');
+    const { eq: eqG, and: andG } = await import('drizzle-orm');
+    const rel = await db
+      .select({ id: guardians.id })
+      .from(guardians)
+      .where(andG(eqG(guardians.acudienteId, me.sub), eqG(guardians.menorId, userId)))
+      .limit(1);
+    if (!rel[0]) return c.json({ error: 'forbidden' }, 403);
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const rows = await db
+    .select({
+      bookingId: bookings.id,
+      estado: bookings.estado,
+      sessionId: classSessions.id,
+      fecha: classSessions.fecha,
+      sessionEstado: classSessions.estado,
+      horaInicio: classTemplates.horaInicio,
+      horaFin: classTemplates.horaFin,
+      nombre: classTemplates.nombre,
+      trainingColor: trainingTypes.colorHex,
+    })
+    .from(bookings)
+    .innerJoin(classSessions, eq(bookings.sessionId, classSessions.id))
+    .innerJoin(classTemplates, eq(classSessions.templateId, classTemplates.id))
+    .innerJoin(trainingTypes, eq(classTemplates.trainingTypeId, trainingTypes.id))
+    .where(and(eq(bookings.userId, userId), gte(classSessions.fecha, today)))
+    .orderBy(classSessions.fecha, classTemplates.horaInicio);
+  return c.json({ bookings: rows });
+});
+
 // Crear reserva
 bookingsRouter.post('/', zValidator('json', createSchema), async (c) => {
   const me = c.get('user');
