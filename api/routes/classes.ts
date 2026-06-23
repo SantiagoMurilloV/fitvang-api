@@ -5,6 +5,7 @@ import { eq, and, gte, lte, sql, inArray } from 'drizzle-orm';
 import { db } from '../db/client';
 import {
   classTemplates,
+  classTemplatePlans,
   classSessions,
   trainingTypes,
   coaches,
@@ -20,16 +21,26 @@ export const classesRouter = new Hono();
 classesRouter.use('*', requireAuth);
 
 // ---- Templates ----
-const templateSchema = z.object({
+const DIAS = ['lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado', 'domingo'] as const;
+
+const programarSchema = z.object({
   nombre: z.string().trim().min(2).max(100),
   trainingTypeId: z.string().uuid(),
-  coachId: z.string().uuid().optional(),
-  diaSemana: z.enum(['lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado', 'domingo']),
-  horaInicio: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
-  horaFin: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
-  capacidadMax: z.number().int().positive().max(500).default(20),
-  activo: z.boolean().default(true),
+  coachId: z.string().uuid().optional().nullable(),
+  dias: z.array(z.enum(DIAS)).min(1),          // uno o varios días
+  horaInicio: z.string().regex(/^\d{2}:\d{2}/),
+  duracionMin: z.number().int().min(15).max(480).default(60),
+  capacidadMax: z.number().int().positive().max(500).optional().nullable(),
+  planIds: z.array(z.string().uuid()).default([]), // vacío = todos
+  repetir: z.enum(['mes', 'siempre']).default('siempre'),
+  generarDias: z.number().int().min(1).max(365).default(60),
 });
+
+function addMinutes(time: string, min: number): string {
+  const [h, m] = time.split(':').map(Number);
+  const total = h * 60 + m + min;
+  return `${String(Math.floor(total / 60) % 24).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+}
 
 classesRouter.get('/templates', async (c) => {
   const rows = await db
@@ -49,17 +60,72 @@ classesRouter.get('/templates', async (c) => {
     })
     .from(classTemplates)
     .innerJoin(trainingTypes, eq(classTemplates.trainingTypeId, trainingTypes.id))
+    .where(eq(classTemplates.activo, true))
     .orderBy(classTemplates.diaSemana, classTemplates.horaInicio);
-  return c.json({ templates: rows });
+
+  // Agregar planIds a cada template
+  const planRows = await db.select().from(classTemplatePlans);
+  const planMap: Record<string, string[]> = {};
+  for (const r of planRows) {
+    if (!planMap[r.templateId]) planMap[r.templateId] = [];
+    planMap[r.templateId].push(r.planTypeId);
+  }
+
+  return c.json({ templates: rows.map((t) => ({ ...t, planIds: planMap[t.id] ?? [] })) });
 });
 
-classesRouter.post('/templates', requireAdmin, zValidator('json', templateSchema), async (c) => {
-  const [row] = await db.insert(classTemplates).values(c.req.valid('json')).returning({ id: classTemplates.id });
-  return c.json({ id: row.id });
+// Crear clase(s) — un bloque puede crear varias plantillas (una por día)
+classesRouter.post('/programar', requireAdmin, zValidator('json', programarSchema), async (c) => {
+  const body = c.req.valid('json');
+  const horaFin = addMinutes(body.horaInicio, body.duracionMin);
+  const created: string[] = [];
+
+  for (const dia of body.dias) {
+    const [row] = await db.insert(classTemplates).values({
+      nombre: body.nombre,
+      trainingTypeId: body.trainingTypeId,
+      coachId: body.coachId ?? undefined,
+      diaSemana: dia,
+      horaInicio: body.horaInicio,
+      horaFin,
+      capacidadMax: body.capacidadMax ?? 20,
+      activo: true,
+    }).returning({ id: classTemplates.id });
+
+    if (body.planIds.length > 0) {
+      await db.insert(classTemplatePlans).values(
+        body.planIds.map((planTypeId) => ({ templateId: row.id, planTypeId }))
+      ).onConflictDoNothing();
+    }
+
+    created.push(row.id);
+  }
+
+  // Generar sesiones
+  const n = await generateUpcomingSessions(body.generarDias);
+  return c.json({ ids: created, sesionesGeneradas: n });
 });
 
-classesRouter.patch('/templates/:id', requireAdmin, zValidator('json', templateSchema.partial()), async (c) => {
-  await db.update(classTemplates).set(c.req.valid('json')).where(eq(classTemplates.id, c.req.param('id')));
+// Desactivar (borrar lógico) una plantilla
+classesRouter.delete('/templates/:id', requireAdmin, async (c) => {
+  await db.update(classTemplates).set({ activo: false }).where(eq(classTemplates.id, c.req.param('id')));
+  return c.json({ ok: true });
+});
+
+classesRouter.patch('/templates/:id', requireAdmin, async (c) => {
+  const body = await c.req.json() as Record<string, unknown>;
+  const { planIds, ...rest } = body;
+  if (Object.keys(rest).length) {
+    await db.update(classTemplates).set(rest as any).where(eq(classTemplates.id, c.req.param('id')));
+  }
+  if (Array.isArray(planIds)) {
+    await db.delete(classTemplatePlans).where(eq(classTemplatePlans.templateId, c.req.param('id')));
+    if (planIds.length > 0) {
+      await db.insert(classTemplatePlans).values(
+        (planIds as string[]).map((pid) => ({ templateId: c.req.param('id'), planTypeId: pid }))
+      ).onConflictDoNothing();
+    }
+  }
   return c.json({ ok: true });
 });
 
@@ -126,11 +192,58 @@ classesRouter.post('/sessions/:id/cancel', requireStaff, async (c) => {
   return c.json({ ok: true, notificados: activeBookings.length });
 });
 
+// Editar hora/capacidad vía la plantilla de una sesión (afecta sesiones futuras del mismo template)
+classesRouter.patch('/sessions/:id', requireAdmin, async (c) => {
+  const { horaInicio, capacidadMax } = await c.req.json().catch(() => ({}));
+  // Obtener templateId de la sesión
+  const [session] = await db.select({ templateId: classSessions.templateId }).from(classSessions).where(eq(classSessions.id, c.req.param('id')));
+  if (!session) return c.json({ error: 'not_found' }, 404);
+  const updates: Record<string, unknown> = {};
+  if (horaInicio) {
+    const t = String(horaInicio).slice(0, 5);
+    updates.horaInicio = t;
+  }
+  if (capacidadMax !== undefined) updates.capacidadMax = capacidadMax;
+  if (Object.keys(updates).length === 0) return c.json({ ok: true });
+  await db.update(classTemplates).set(updates as any).where(eq(classTemplates.id, session.templateId));
+  return c.json({ ok: true });
+});
+
+// Eliminar una sesión específica
+classesRouter.delete('/sessions/:id', requireAdmin, async (c) => {
+  await db.delete(classSessions).where(eq(classSessions.id, c.req.param('id')));
+  return c.json({ ok: true });
+});
+
 // Generar sesiones manualmente
 classesRouter.post('/generate', requireAdmin, async (c) => {
   const days = Number(c.req.query('days') ?? '30');
   const n = await generateUpcomingSessions(days);
   return c.json({ inserted: n });
+});
+
+// Limpiar sesiones futuras (zona de peligro)
+classesRouter.delete('/sessions/clear', requireAdmin, async (c) => {
+  const mes = c.req.query('mes'); // formato 'yyyy-MM', opcional
+  const today = new Date().toISOString().slice(0, 10);
+
+  let deleted: { id: string }[];
+  if (mes) {
+    const from = `${mes}-01`;
+    const lastDay = new Date(Number(mes.slice(0, 4)), Number(mes.slice(5, 7)), 0).getDate();
+    const to = `${mes}-${String(lastDay).padStart(2, '0')}`;
+    deleted = await db
+      .delete(classSessions)
+      .where(and(eq(classSessions.estado, 'programada'), gte(classSessions.fecha, from), lte(classSessions.fecha, to)))
+      .returning({ id: classSessions.id });
+  } else {
+    deleted = await db
+      .delete(classSessions)
+      .where(and(eq(classSessions.estado, 'programada'), gte(classSessions.fecha, today)))
+      .returning({ id: classSessions.id });
+  }
+
+  return c.json({ deleted: deleted.length });
 });
 
 // Lista de asistentes de una sesión (coach view)

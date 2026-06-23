@@ -211,6 +211,18 @@ export const classTemplates = pgTable(
   })
 );
 
+// Planes que tienen acceso a una plantilla de clase
+export const classTemplatePlans = pgTable(
+  'class_template_plans',
+  {
+    templateId: uuid('template_id').notNull().references(() => classTemplates.id, { onDelete: 'cascade' }),
+    planTypeId: uuid('plan_type_id').notNull().references(() => planTypes.id, { onDelete: 'cascade' }),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.templateId, t.planTypeId] }),
+  })
+);
+
 export const classSessions = pgTable(
   'class_sessions',
   {
