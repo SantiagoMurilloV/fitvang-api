@@ -42,6 +42,8 @@ app.use(
       if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return origin;
       // Vercel preview URLs
       if (/^https:\/\/fitvang.*\.vercel\.app$/.test(origin)) return origin;
+      // Dominio de producción
+      if (/^https:\/\/([a-z]+\.)?fitvang\.com$/.test(origin)) return origin;
       return null;
     },
     credentials: true,
