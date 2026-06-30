@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { eq, desc, and } from 'drizzle-orm';
 import { addDays, format } from 'date-fns';
 import { db } from '../db/client';
-import { planTypes, planGroups, userPlans, trainingTypes } from '../db/schema';
+import { planTypes, planGroups, userPlans, trainingTypes, payments } from '../db/schema';
 import { requireAuth } from '../middleware/jwt';
 import { requireAdmin } from '../middleware/rbac';
 
@@ -82,13 +82,18 @@ plansRouter.post('/assign', requireAdmin, zValidator('json', assignSchema), asyn
   const fechaFin = format(addDays(today, pt[0].duracionDias), 'yyyy-MM-dd');
   const precio = body.precioCopAplicado ?? pt[0].precioBaseCop;
 
-  // Cancelar planes activos previos + crear el nuevo de forma atómica:
-  // evita dejar al usuario con dos planes activos o con ninguno si algo falla.
+  // Multi-plan: un usuario puede tener varios planes activos a la vez. Solo se
+  // reemplaza un plan activo del MISMO tipo (renovación), no se tocan los demás.
+  // Además se crea un pago PENDIENTE por el valor del plan (Pagos → Pendientes).
   const userPlanId = await db.transaction(async (tx) => {
     await tx
       .update(userPlans)
       .set({ estado: 'cancelado' })
-      .where(and(eq(userPlans.userId, body.userId), eq(userPlans.estado, 'activo')));
+      .where(and(
+        eq(userPlans.userId, body.userId),
+        eq(userPlans.estado, 'activo'),
+        eq(userPlans.planTypeId, body.planTypeId),
+      ));
 
     const [row] = await tx
       .insert(userPlans)
@@ -104,9 +109,34 @@ plansRouter.post('/assign', requireAdmin, zValidator('json', assignSchema), asyn
         notasAdmin: body.notasAdmin,
       })
       .returning({ id: userPlans.id });
+
+    // Finanza pendiente del plan: se paga en efectivo (admin/coach) o por Wompi
+    // cuando haya credenciales. metodo 'efectivo' es solo el valor por defecto.
+    await tx.insert(payments).values({
+      userId: body.userId,
+      userPlanId: row.id,
+      planGroupId: body.planGroupId,
+      montoCop: precio,
+      metodo: 'efectivo',
+      estado: 'pendiente',
+      registradoPor: me.sub,
+      notas: 'Cargo por asignación de plan',
+    });
+
     return row.id;
   });
   return c.json({ userPlanId, fechaFin });
+});
+
+// Desactivar (cancelar) un plan asignado a un usuario. Borra su cargo pendiente
+// si aún no se había pagado.
+plansRouter.delete('/assign/:id', requireAdmin, async (c) => {
+  const id = c.req.param('id');
+  await db.transaction(async (tx) => {
+    await tx.update(userPlans).set({ estado: 'cancelado' }).where(eq(userPlans.id, id));
+    await tx.delete(payments).where(and(eq(payments.userPlanId, id), eq(payments.estado, 'pendiente')));
+  });
+  return c.json({ ok: true });
 });
 
 // Mi plan activo
@@ -132,9 +162,9 @@ plansRouter.get('/me', async (c) => {
     .innerJoin(planTypes, eq(userPlans.planTypeId, planTypes.id))
     .innerJoin(trainingTypes, eq(planTypes.trainingTypeId, trainingTypes.id))
     .where(and(eq(userPlans.userId, me.sub), eq(userPlans.estado, 'activo')))
-    .orderBy(desc(userPlans.fechaInicio))
-    .limit(1);
-  return c.json({ plan: rows[0] ?? null });
+    .orderBy(desc(userPlans.fechaInicio));
+  // `plan` (el primero) por compatibilidad; `plans` = todos los activos (multi-plan)
+  return c.json({ plan: rows[0] ?? null, plans: rows });
 });
 
 // Grupos

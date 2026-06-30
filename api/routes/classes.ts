@@ -11,6 +11,7 @@ import {
   coaches,
   bookings,
   users,
+  userPlans,
 } from '../db/schema';
 import { requireAuth } from '../middleware/jwt';
 import { requireAdmin, requireStaff } from '../middleware/rbac';
@@ -165,6 +166,7 @@ classesRouter.patch('/templates/:id', requireAdmin, async (c) => {
 
 // ---- Sessions ----
 classesRouter.get('/sessions', async (c) => {
+  const me = c.get('user');
   const from = c.req.query('from') ?? new Date().toISOString().slice(0, 10);
   const to = c.req.query('to') ?? from;
   const trainingSlug = c.req.query('training');
@@ -194,7 +196,29 @@ classesRouter.get('/sessions', async (c) => {
     .where(and(eq(classTemplates.activo, true), gte(classSessions.fecha, from), lte(classSessions.fecha, to)))
     .orderBy(classSessions.fecha, classTemplates.horaInicio);
 
-  const filtered = trainingSlug ? rows.filter((r) => r.trainingSlug === trainingSlug) : rows;
+  let visible = rows;
+
+  // Visibilidad por plan: un usuario solo ve las clases que su plan activo puede
+  // tomar. Una plantilla SIN planes asignados se considera abierta a todos.
+  // Staff (coach/admin) ve todas. Usuario sin plan activo también ve todas
+  // (puede explorar; la reserva se bloquea por 'sin_plan_activo').
+  if (me.rol === 'user') {
+    const planRows = await db
+      .select({ planTypeId: userPlans.planTypeId })
+      .from(userPlans)
+      .where(and(eq(userPlans.userId, me.sub), eq(userPlans.estado, 'activo')));
+    const planTypeIds = new Set(planRows.map((r) => r.planTypeId));
+    if (planTypeIds.size > 0) {
+      const tp = await db
+        .select({ templateId: classTemplatePlans.templateId, planTypeId: classTemplatePlans.planTypeId })
+        .from(classTemplatePlans);
+      const restricted = new Set(tp.map((r) => r.templateId)); // plantillas con planes asignados
+      const allowed = new Set(tp.filter((r) => planTypeIds.has(r.planTypeId)).map((r) => r.templateId));
+      visible = rows.filter((r) => !restricted.has(r.templateId) || allowed.has(r.templateId));
+    }
+  }
+
+  const filtered = trainingSlug ? visible.filter((r) => r.trainingSlug === trainingSlug) : visible;
   return c.json({ sessions: filtered });
 });
 

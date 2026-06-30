@@ -165,27 +165,72 @@ paymentsRouter.post('/efectivo', requireStaff, zValidator('json', cashSchema), a
   return c.json({ id: payId });
 });
 
-// Lista global (admin) — paginada
+// Lista global (admin/coach) — paginada. Filtros: ?userId= y ?estado=
+// Incluye foto, nombre y, si el pago va ligado a un plan, las fechas de la suscripción.
 paymentsRouter.get('/', requireStaff, async (c) => {
   const limit = Math.min(Math.max(Number(c.req.query('limit') ?? 100), 1), 500);
   const offset = Math.max(Number(c.req.query('offset') ?? 0), 0);
   const userId = c.req.query('userId');
+  const estado = c.req.query('estado') as 'pendiente' | 'exitoso' | 'fallido' | 'reembolsado' | undefined;
+
+  const conds = [];
+  if (userId) conds.push(eq(payments.userId, userId));
+  if (estado) conds.push(eq(payments.estado, estado));
+
   const rows = await db
     .select({
       id: payments.id,
       userId: payments.userId,
       nombre: users.nombreCompleto,
+      avatarUrl: users.avatarUrl,
       monto: payments.montoCop,
       metodo: payments.metodo,
       estado: payments.estado,
       createdAt: payments.createdAt,
       notas: payments.notas,
+      planNombre: planTypes.nombre,
+      fechaInicio: userPlans.fechaInicio,
+      fechaFin: userPlans.fechaFin,
     })
     .from(payments)
     .innerJoin(users, eq(payments.userId, users.id))
-    .where(userId ? eq(payments.userId, userId) : undefined)
+    .leftJoin(userPlans, eq(payments.userPlanId, userPlans.id))
+    .leftJoin(planTypes, eq(userPlans.planTypeId, planTypes.id))
+    .where(conds.length ? and(...conds) : undefined)
     .orderBy(desc(payments.createdAt))
     .limit(limit)
     .offset(offset);
   return c.json({ payments: rows, limit, offset });
+});
+
+// Marcar un pago pendiente como pagado (efectivo / Wompi manual). Solo staff.
+const markPaidSchema = z.object({
+  metodo: z.enum(['efectivo', 'wompi_card', 'wompi_nequi', 'wompi_pse']).default('efectivo'),
+});
+paymentsRouter.patch('/:id', requireStaff, zValidator('json', markPaidSchema), async (c) => {
+  const me = c.get('user');
+  const id = c.req.param('id');
+  const body = c.req.valid('json');
+  const rows = await db.select().from(payments).where(eq(payments.id, id)).limit(1);
+  const p = rows[0];
+  if (!p) return c.json({ error: 'not_found' }, 404);
+  if (p.estado === 'exitoso') return c.json({ ok: true }); // ya estaba pagado
+
+  await db.transaction(async (tx) => {
+    await tx
+      .update(payments)
+      .set({ estado: 'exitoso', metodo: body.metodo, registradoPor: me.sub, updatedAt: new Date() })
+      .where(eq(payments.id, id));
+    if (p.userPlanId) {
+      await tx.update(userPlans).set({ estado: 'activo' }).where(eq(userPlans.id, p.userPlanId));
+    }
+  });
+
+  await notifyUser(p.userId, {
+    title: 'Pago confirmado',
+    body: `Tu pago de $${p.montoCop.toLocaleString('es-CO')} COP quedó registrado.`,
+    url: '/app/pagos',
+  }, { tipo: 'pago_ok' });
+
+  return c.json({ ok: true });
 });

@@ -291,12 +291,12 @@ usersRouter.get('/:id/ficha', async (c) => {
     .innerJoin(planTypes, eq(userPlans.planTypeId, planTypes.id))
     .innerJoin(trainingTypes, eq(planTypes.trainingTypeId, trainingTypes.id))
     .where(and(eq(userPlans.userId, id), eq(userPlans.estado, 'activo')))
-    .orderBy(desc(userPlans.fechaInicio))
-    .limit(1);
+    .orderBy(desc(userPlans.fechaInicio));
 
   // La contraseña en claro solo se expone al super_admin
   const user = me.rol === 'super_admin' ? rows[0] : { ...rows[0], passwordPlain: undefined };
-  return c.json({ user, planActivo: planRows[0] ?? null });
+  // planActivo (el primero) por compatibilidad; planesActivos = todos (multi-plan)
+  return c.json({ user, planActivo: planRows[0] ?? null, planesActivos: planRows });
 });
 
 // Acudientes del menor

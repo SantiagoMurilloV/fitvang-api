@@ -7,6 +7,7 @@ import {
   bookings,
   classSessions,
   classTemplates,
+  classTemplatePlans,
   trainingTypes,
   userPlans,
   planTypes,
@@ -25,6 +26,46 @@ bookingsRouter.use('*', requireAuth);
 const createSchema = z.object({ sessionId: z.string().uuid() });
 
 const TZ_BOG = 'America/Bogota';
+
+// Elige un plan ACTIVO del usuario que cubra la sesión (training + restricción
+// explícita por plan en class_template_plans) y que tenga cupo de sesiones.
+// Soporta múltiples planes activos por usuario. Devuelve el plan o un código error.
+async function resolvePlanForSession(
+  userId: string,
+  sess: { templateId: string; trainingTypeId: string },
+): Promise<{ plan?: { userPlanId: string; planTypeId: string }; error?: string }> {
+  const planRows = await db
+    .select({
+      userPlanId: userPlans.id,
+      planTypeId: userPlans.planTypeId,
+      trainingTypeId: planTypes.trainingTypeId,
+      accesoMulti: trainingTypes.accesoMulti,
+      sesionesTotales: userPlans.sesionesTotales,
+      sesionesUsadas: userPlans.sesionesUsadas,
+    })
+    .from(userPlans)
+    .innerJoin(planTypes, eq(userPlans.planTypeId, planTypes.id))
+    .innerJoin(trainingTypes, eq(planTypes.trainingTypeId, trainingTypes.id))
+    .where(and(eq(userPlans.userId, userId), eq(userPlans.estado, 'activo')));
+  if (planRows.length === 0) return { error: 'sin_plan_activo' };
+
+  const tplPlans = await db
+    .select({ planTypeId: classTemplatePlans.planTypeId })
+    .from(classTemplatePlans)
+    .where(eq(classTemplatePlans.templateId, sess.templateId));
+  const allowed = new Set(tplPlans.map((p) => p.planTypeId));
+
+  const covering = planRows.filter(
+    (p) =>
+      (p.accesoMulti || p.trainingTypeId === sess.trainingTypeId) &&
+      (allowed.size === 0 || allowed.has(p.planTypeId)),
+  );
+  if (covering.length === 0) return { error: 'plan_no_cubre_training' };
+
+  const usable = covering.find((p) => p.sesionesTotales == null || p.sesionesUsadas < p.sesionesTotales);
+  if (!usable) return { error: 'plan_sin_sesiones' };
+  return { plan: { userPlanId: usable.userPlanId, planTypeId: usable.planTypeId } };
+}
 
 // Mis reservas
 bookingsRouter.get('/me', async (c) => {
@@ -98,29 +139,11 @@ bookingsRouter.post('/', zValidator('json', createSchema), async (c) => {
   const me = c.get('user');
   const { sessionId } = c.req.valid('json');
 
-  // 1. Validar plan activo y acceso al training
-  const planRows = await db
-    .select({
-      userPlanId: userPlans.id,
-      estado: userPlans.estado,
-      sesionesTotales: userPlans.sesionesTotales,
-      sesionesUsadas: userPlans.sesionesUsadas,
-      trainingTypeId: planTypes.trainingTypeId,
-      accesoMulti: trainingTypes.accesoMulti,
-      trainingSlug: trainingTypes.slug,
-    })
-    .from(userPlans)
-    .innerJoin(planTypes, eq(userPlans.planTypeId, planTypes.id))
-    .innerJoin(trainingTypes, eq(planTypes.trainingTypeId, trainingTypes.id))
-    .where(and(eq(userPlans.userId, me.sub), eq(userPlans.estado, 'activo')))
-    .limit(1);
-  const plan = planRows[0];
-  if (!plan) return c.json({ error: 'sin_plan_activo' }, 403);
-
-  // 2. Validar sesión y cupos
+  // 1. Validar sesión y cupos
   const sessRows = await db
     .select({
       id: classSessions.id,
+      templateId: classSessions.templateId,
       estado: classSessions.estado,
       fecha: classSessions.fecha,
       horaInicio: classTemplates.horaInicio,
@@ -138,11 +161,8 @@ bookingsRouter.post('/', zValidator('json', createSchema), async (c) => {
   if (!sess) return c.json({ error: 'sesion_no_encontrada' }, 404);
   if (sess.estado !== 'programada') return c.json({ error: 'sesion_no_disponible' }, 400);
 
-  // 3. Acceso al training: VIP accede a todo excepto kids; resto solo a su training
+  // 2. Clases Kids: solo el admin inscribe
   if (sess.trainingSlug === 'kids') return c.json({ error: 'kids_solo_por_admin' }, 403);
-  if (!plan.accesoMulti && plan.trainingTypeId !== sess.trainingTypeId) {
-    return c.json({ error: 'plan_no_cubre_training' }, 403);
-  }
 
   // ── Reglas de tiempo (igual que Bullfit) ──────────────────────────────
   const nowBog = toZonedTime(new Date(), TZ_BOG);
@@ -166,10 +186,13 @@ bookingsRouter.post('/', zValidator('json', createSchema), async (c) => {
     .limit(1);
   if (dup[0]) return c.json({ error: 'ya_reservada' }, 409);
 
-  // 5. Límite de sesiones del plan (si el plan tiene cupo de sesiones)
-  if (plan.sesionesTotales != null && plan.sesionesUsadas >= plan.sesionesTotales) {
-    return c.json({ error: 'plan_sin_sesiones', message: 'Tu plan no tiene sesiones disponibles.' }, 403);
+  // 5. Elegir un plan activo que cubra la clase y tenga cupo de sesiones
+  const resolved = await resolvePlanForSession(me.sub, sess);
+  if (resolved.error) {
+    const msg = resolved.error === 'plan_sin_sesiones' ? 'Tu plan no tiene sesiones disponibles.' : undefined;
+    return c.json(msg ? { error: resolved.error, message: msg } : { error: resolved.error }, 403);
   }
+  const usable = resolved.plan!;
 
   // 6. Cupos
   if (sess.ocupados >= sess.capacidadMax) {
@@ -193,7 +216,7 @@ bookingsRouter.post('/', zValidator('json', createSchema), async (c) => {
     await tx
       .update(userPlans)
       .set({ sesionesUsadas: sql`${userPlans.sesionesUsadas} + 1` })
-      .where(eq(userPlans.id, plan.userPlanId));
+      .where(eq(userPlans.id, usable.userPlanId));
     return row.id;
   });
   return c.json({ bookingId });
@@ -321,25 +344,11 @@ bookingsRouter.put('/:id', zValidator('json', rescheduleSchema), async (c) => {
     return c.json({ error: 'muy_tarde_para_editar', message: 'Solo puedes reagendar con al menos 1 hora de anticipación.' }, 400);
   }
 
-  // 2. Plan activo + acceso
-  const planRows = await db
-    .select({
-      userPlanId: userPlans.id,
-      trainingTypeId: planTypes.trainingTypeId,
-      accesoMulti: trainingTypes.accesoMulti,
-    })
-    .from(userPlans)
-    .innerJoin(planTypes, eq(userPlans.planTypeId, planTypes.id))
-    .innerJoin(trainingTypes, eq(planTypes.trainingTypeId, trainingTypes.id))
-    .where(and(eq(userPlans.userId, old.booking.userId), eq(userPlans.estado, 'activo')))
-    .limit(1);
-  const plan = planRows[0];
-  if (!plan) return c.json({ error: 'sin_plan_activo' }, 403);
-
-  // 3. Nueva sesión
+  // 2. Nueva sesión
   const sessRows = await db
     .select({
       id: classSessions.id,
+      templateId: classSessions.templateId,
       estado: classSessions.estado,
       fecha: classSessions.fecha,
       horaInicio: classTemplates.horaInicio,
@@ -357,8 +366,12 @@ bookingsRouter.put('/:id', zValidator('json', rescheduleSchema), async (c) => {
   if (!sess) return c.json({ error: 'sesion_no_encontrada' }, 404);
   if (sess.estado !== 'programada') return c.json({ error: 'sesion_no_disponible' }, 400);
   if (sess.trainingSlug === 'kids') return c.json({ error: 'kids_solo_por_admin' }, 403);
-  if (!plan.accesoMulti && plan.trainingTypeId !== sess.trainingTypeId) {
-    return c.json({ error: 'plan_no_cubre_training' }, 403);
+
+  // Algún plan activo debe cubrir la nueva clase (multi-plan)
+  const resolved = await resolvePlanForSession(old.booking.userId, { templateId: sess.templateId, trainingTypeId: sess.trainingTypeId });
+  if (resolved.error) {
+    const msg = resolved.error === 'plan_sin_sesiones' ? 'Tu plan no tiene sesiones disponibles.' : undefined;
+    return c.json(msg ? { error: resolved.error, message: msg } : { error: resolved.error }, 403);
   }
 
   const nowBog = toZonedTime(new Date(), TZ_BOG);
