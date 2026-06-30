@@ -243,20 +243,9 @@ classesRouter.patch('/sessions/:id', requireAdmin, async (c) => {
   return c.json({ ok: true });
 });
 
-// Eliminar una sesión específica
-classesRouter.delete('/sessions/:id', requireAdmin, async (c) => {
-  await db.delete(classSessions).where(eq(classSessions.id, c.req.param('id')));
-  return c.json({ ok: true });
-});
-
-// Generar sesiones manualmente
-classesRouter.post('/generate', requireAdmin, async (c) => {
-  const days = Number(c.req.query('days') ?? '30');
-  const n = await generateUpcomingSessions(days);
-  return c.json({ inserted: n });
-});
-
-// Limpiar sesiones futuras (zona de peligro)
+// Limpiar sesiones futuras (zona de peligro).
+// IMPORTANTE: debe ir ANTES de /sessions/:id — si no, Hono toma 'clear' como :id
+// (no es UUID) y la query falla con error 500.
 classesRouter.delete('/sessions/clear', requireAdmin, async (c) => {
   const mes = c.req.query('mes'); // formato 'yyyy-MM', opcional
   const today = new Date().toISOString().slice(0, 10);
@@ -278,6 +267,19 @@ classesRouter.delete('/sessions/clear', requireAdmin, async (c) => {
   }
 
   return c.json({ deleted: deleted.length });
+});
+
+// Eliminar una sesión específica
+classesRouter.delete('/sessions/:id', requireAdmin, async (c) => {
+  await db.delete(classSessions).where(eq(classSessions.id, c.req.param('id')));
+  return c.json({ ok: true });
+});
+
+// Generar sesiones manualmente
+classesRouter.post('/generate', requireAdmin, async (c) => {
+  const days = Number(c.req.query('days') ?? '30');
+  const n = await generateUpcomingSessions(days);
+  return c.json({ inserted: n });
 });
 
 // Lista de asistentes de una sesión (coach view)
