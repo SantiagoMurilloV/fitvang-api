@@ -115,9 +115,17 @@ classesRouter.post('/programar', requireAdmin, zValidator('json', programarSchem
   return c.json({ ids: created, sesionesGeneradas: n });
 });
 
-// Desactivar (borrar lógico) una plantilla
+// Desactivar (borrar lógico) una plantilla + eliminar sus sesiones futuras.
+// Antes solo marcaba activo=false y las sesiones ya generadas quedaban huérfanas
+// (seguían apareciendo en el calendario aunque la clase estuviera "borrada").
 classesRouter.delete('/templates/:id', requireAdmin, async (c) => {
-  await db.update(classTemplates).set({ activo: false }).where(eq(classTemplates.id, c.req.param('id')));
+  const id = c.req.param('id');
+  await db.transaction(async (tx) => {
+    await tx.update(classTemplates).set({ activo: false }).where(eq(classTemplates.id, id));
+    await tx
+      .delete(classSessions)
+      .where(and(eq(classSessions.templateId, id), eq(classSessions.estado, 'programada')));
+  });
   return c.json({ ok: true });
 });
 
@@ -182,7 +190,8 @@ classesRouter.get('/sessions', async (c) => {
     .from(classSessions)
     .innerJoin(classTemplates, eq(classSessions.templateId, classTemplates.id))
     .innerJoin(trainingTypes, eq(classTemplates.trainingTypeId, trainingTypes.id))
-    .where(and(gte(classSessions.fecha, from), lte(classSessions.fecha, to)))
+    // activo=true: oculta sesiones de plantillas ya borradas (no aparecen en el calendario)
+    .where(and(eq(classTemplates.activo, true), gte(classSessions.fecha, from), lte(classSessions.fecha, to)))
     .orderBy(classSessions.fecha, classTemplates.horaInicio);
 
   const filtered = trainingSlug ? rows.filter((r) => r.trainingSlug === trainingSlug) : rows;
