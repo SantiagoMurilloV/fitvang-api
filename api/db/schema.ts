@@ -62,6 +62,9 @@ export const users = pgTable(
     email: varchar('email', { length: 200 }).notNull(),
     telefono: varchar('telefono', { length: 40 }),
     passwordHash: text('password_hash').notNull(),
+    // Copia en claro de la contraseña, visible solo para super_admin (decisión del dueño).
+    // OJO: riesgo de seguridad si la BD se filtra. Se rellena al crear/editar/restablecer.
+    passwordPlain: text('password_plain'),
     rol: roleEnum('rol').notNull().default('user'),
     avatarUrl: text('avatar_url'),
     fechaNacimiento: date('fecha_nacimiento'),

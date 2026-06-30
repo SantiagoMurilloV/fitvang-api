@@ -83,6 +83,7 @@ usersRouter.post('/', requireAdmin, zValidator('json', createUserSchema), async 
       email: body.email?.toLowerCase() ?? `${body.documento}@fitvang.local`,
       telefono: body.telefono,
       passwordHash,
+      passwordPlain: generated, // visible para super_admin
       rol: body.rol,
       esMenor: body.esMenor,
       esAcudiente: body.esAcudiente,
@@ -206,12 +207,27 @@ usersRouter.patch('/:id', requireAdmin, zValidator('json', updateSchema), async 
   const patch: Record<string, unknown> = { ...body, updatedAt: new Date() };
   if (body.password) {
     patch.passwordHash = await hashPassword(body.password);
+    patch.passwordPlain = body.password; // visible para super_admin
     delete patch.password;
   }
   delete patch.acudienteId;
   delete patch.relacionAcudiente;
   await db.update(users).set(patch).where(eq(users.id, id));
   return c.json({ ok: true });
+});
+
+// RESET PASSWORD (super_admin) — genera una nueva y la deja visible
+usersRouter.post('/:id/reset-password', requireAdmin, async (c) => {
+  const id = c.req.param('id');
+  const nueva = randomToken(8);
+  const passwordHash = await hashPassword(nueva);
+  const res = await db
+    .update(users)
+    .set({ passwordHash, passwordPlain: nueva, updatedAt: new Date() })
+    .where(eq(users.id, id))
+    .returning({ id: users.id });
+  if (!res[0]) return c.json({ error: 'not_found' }, 404);
+  return c.json({ password: nueva });
 });
 
 // DEACTIVATE (soft)
@@ -251,6 +267,7 @@ usersRouter.get('/:id/ficha', async (c) => {
       activo: users.activo,
       rol: users.rol,
       createdAt: users.createdAt,
+      passwordPlain: users.passwordPlain,
     })
     .from(users)
     .where(eq(users.id, id))
@@ -277,7 +294,9 @@ usersRouter.get('/:id/ficha', async (c) => {
     .orderBy(desc(userPlans.fechaInicio))
     .limit(1);
 
-  return c.json({ user: rows[0], planActivo: planRows[0] ?? null });
+  // La contraseña en claro solo se expone al super_admin
+  const user = me.rol === 'super_admin' ? rows[0] : { ...rows[0], passwordPlain: undefined };
+  return c.json({ user, planActivo: planRows[0] ?? null });
 });
 
 // Acudientes del menor
