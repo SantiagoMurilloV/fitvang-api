@@ -2,8 +2,9 @@ import { sql, eq, and, gte, lte } from 'drizzle-orm';
 import { format, startOfMonth, endOfMonth } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 import { db } from '../db/client';
-import { bookings, classSessions, attendanceScoring } from '../db/schema';
+import { bookings, classSessions, attendanceScoring, users } from '../db/schema';
 import { isBusinessDay, businessDaysSince } from '../lib/colombianHolidays';
+import { notifyUser } from './webpush.service';
 
 const TZ = 'America/Bogota';
 
@@ -56,28 +57,8 @@ function prevWeekKey(wk: string): string {
   return weekKey(format(prev, 'yyyy-MM-dd'));
 }
 
-/**
- * Una semana es COMPLETA si tiene ≥3 días hábiles consecutivos con asistencia.
- * Igual que Bullfit: excluye festivos, solo L–V.
- */
-function hasThreeConsecutive(attendedSet: Set<string>, mondayStr: string): boolean {
-  const bizDays: string[] = [];
-  for (let i = 0; i < 5; i++) {
-    const d = new Date(mondayStr + 'T12:00:00Z');
-    d.setUTCDate(d.getUTCDate() + i);
-    const s = format(d, 'yyyy-MM-dd');
-    if (isBusinessDay(s)) bizDays.push(s);
-  }
-  for (let i = 0; i <= bizDays.length - 3; i++) {
-    if (
-      attendedSet.has(bizDays[i]) &&
-      attendedSet.has(bizDays[i + 1]) &&
-      attendedSet.has(bizDays[i + 2])
-    ) return true;
-  }
-  return false;
-}
-
+// Una semana cuenta para la racha si tiene ≥3 asistencias en días hábiles
+// (no exige que sean consecutivas). Excluye festivos (solo L–V).
 function computeStreakFromDays(attendedDays: string[]): { rachaActual: number; rachaMaxima: number } {
   const today = format(toZonedTime(new Date(), TZ), 'yyyy-MM-dd');
   const todayWk = weekKey(today);
@@ -97,16 +78,16 @@ function computeStreakFromDays(attendedDays: string[]): { rachaActual: number; r
   let rachaActual = 0;
   let checkWk = todayWk;
 
-  // Semana actual cuenta si ya completó 3 consecutivos
+  // Una semana cuenta para la racha si tiene ≥3 asistencias (días hábiles)
   const todaySet = weekMap.get(checkWk);
-  if (todaySet && hasThreeConsecutive(todaySet, mondayOfWeek(checkWk))) {
+  if (todaySet && todaySet.size >= 3) {
     rachaActual++;
   }
 
   checkWk = prevWeekKey(checkWk);
   while (true) {
     const s = weekMap.get(checkWk);
-    if (!s || !hasThreeConsecutive(s, mondayOfWeek(checkWk))) break;
+    if (!s || s.size < 3) break;
     rachaActual++;
     checkWk = prevWeekKey(checkWk);
   }
@@ -118,7 +99,7 @@ function computeStreakFromDays(attendedDays: string[]): { rachaActual: number; r
   let prevWk: string | null = null;
   for (const wk of sortedWeeks) {
     const s = weekMap.get(wk)!;
-    const complete = hasThreeConsecutive(s, mondayOfWeek(wk));
+    const complete = s.size >= 3;
     const gap = prevWk ? wk !== weekKey(
       format(new Date(mondayOfWeek(prevWk) + 'T12:00:00Z'), 'yyyy-MM-dd').replace(
         /(\d{4}-\d{2}-\d{2})/,
@@ -216,6 +197,40 @@ export async function persistScoring(userId: string): Promise<UserScoring> {
       },
     });
   return s;
+}
+
+// Hitos de racha (en semanas) que dan premio. Al alcanzar uno, se avisa al admin.
+const RACHA_PREMIOS = [4, 8, 12, 24, 52];
+
+/**
+ * Si el usuario alcanza EXACTAMENTE un hito de racha, notifica a los super_admin
+ * para que le entreguen el premio. Deduplicado por usuario+hito+admin.
+ * Best-effort: nunca lanza.
+ */
+export async function notifyStreakRewardToAdmins(userId: string): Promise<void> {
+  try {
+    const s = await computeUserScoring(userId);
+    const premio = RACHA_PREMIOS.find((m) => m === s.rachaActual);
+    if (!premio) return;
+
+    const [u] = await db.select({ nombre: users.nombreCompleto }).from(users).where(eq(users.id, userId)).limit(1);
+    const nombre = u?.nombre ?? 'Un miembro';
+    const admins = await db.select({ id: users.id }).from(users).where(and(eq(users.rol, 'super_admin'), eq(users.activo, true)));
+
+    for (const a of admins) {
+      await notifyUser(
+        a.id,
+        {
+          title: 'Premio de racha por entregar',
+          body: `${nombre} alcanzó una racha de ${premio} semanas seguidas. ¡Hora de entregarle su premio!`,
+          url: '/admin',
+        },
+        { tipo: 'sistema', dedupeKey: `racha-premio-${userId}-${premio}-${a.id}` },
+      ).catch(() => {});
+    }
+  } catch {
+    /* best-effort */
+  }
 }
 
 // Re-exportar para uso en jobs

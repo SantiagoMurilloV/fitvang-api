@@ -75,6 +75,8 @@ export const users = pgTable(
     alturaCm: integer('altura_cm'),
     bio: text('bio'),
     activo: boolean('activo').notNull().default(true),
+    terminosAceptadosAt: timestamp('terminos_aceptados_at', { withTimezone: true }),
+    terminosDocUrl: text('terminos_doc_url'),
     createdBy: uuid('created_by'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),

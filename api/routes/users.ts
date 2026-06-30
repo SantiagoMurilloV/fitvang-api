@@ -8,9 +8,42 @@ import { hashPassword, randomToken } from '../lib/password';
 import { requireAuth } from '../middleware/jwt';
 import { requireAdmin, requireStaff, checkSelf } from '../middleware/rbac';
 import { notifyUser } from '../services/webpush.service';
+import { uploadRawDoc } from '../lib/cloudinary';
+import { terminosHtml, TERMINOS_SECCIONES, TERMINOS_VERSION } from '../lib/terminos';
 
 export const usersRouter = new Hono();
 usersRouter.use('*', requireAuth);
+
+// Términos y condiciones (para mostrar en el modal). Antes de '/:id' para que no choque.
+usersRouter.get('/terminos', (c) => c.json({ version: TERMINOS_VERSION, secciones: TERMINOS_SECCIONES }));
+
+// Aceptar T&C: genera el documento con los datos del usuario, lo guarda en Cloudinary
+// y marca la aceptación. Idempotente.
+usersRouter.post('/me/aceptar-terminos', async (c) => {
+  const me = c.get('user');
+  const [u] = await db
+    .select({ nombre: users.nombreCompleto, documento: users.documento, aceptadoAt: users.terminosAceptadosAt })
+    .from(users)
+    .where(eq(users.id, me.sub))
+    .limit(1);
+  if (!u) return c.json({ error: 'not_found' }, 404);
+  if (u.aceptadoAt) return c.json({ ok: true, yaAceptado: true });
+
+  const fecha = new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota', dateStyle: 'long', timeStyle: 'short' });
+  const html = terminosHtml({ nombre: u.nombre, documento: u.documento, fecha });
+
+  let url = '';
+  try {
+    url = await uploadRawDoc(`fitvang/terminos/${me.sub}-${Date.now()}`, html);
+  } catch (e) {
+    console.error('[terminos] cloudinary falló, registro la aceptación igual:', e);
+  }
+  await db
+    .update(users)
+    .set({ terminosAceptadosAt: new Date(), terminosDocUrl: url || null, updatedAt: new Date() })
+    .where(eq(users.id, me.sub));
+  return c.json({ ok: true, url });
+});
 
 const createUserSchema = z.object({
   nombreCompleto: z.string().trim().min(2).max(120),
@@ -268,6 +301,8 @@ usersRouter.get('/:id/ficha', async (c) => {
       rol: users.rol,
       createdAt: users.createdAt,
       passwordPlain: users.passwordPlain,
+      terminosAceptadosAt: users.terminosAceptadosAt,
+      terminosDocUrl: users.terminosDocUrl,
     })
     .from(users)
     .where(eq(users.id, id))

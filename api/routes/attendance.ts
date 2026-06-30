@@ -7,7 +7,7 @@ import { bookings, attendances, classSessions, classTemplates, users, guardians 
 import { requireAuth } from '../middleware/jwt';
 import { requireStaff } from '../middleware/rbac';
 import { notifyUser } from '../services/webpush.service';
-import { persistScoring } from '../services/scoring.service';
+import { persistScoring, notifyStreakRewardToAdmins } from '../services/scoring.service';
 
 export const attendanceRouter = new Hono();
 attendanceRouter.use('*', requireAuth, requireStaff);
@@ -64,6 +64,7 @@ attendanceRouter.post('/mark', zValidator('json', markSchema), async (c) => {
       url: '/app/asistencias',
     }, { tipo: 'asistencia' });
     persistScoring(userId).catch(() => {});
+    notifyStreakRewardToAdmins(userId).catch(() => {});
 
     // Notificar al acudiente si el usuario es menor
     const userRow = await db.select({ esMenor: users.esMenor, nombre: users.nombreCompleto })
@@ -118,6 +119,7 @@ attendanceRouter.post('/bulk', zValidator('json', bulkSchema), async (c) => {
           url: '/app/asistencias',
         }, { tipo: 'asistencia' }),
         persistScoring(b.userId),
+        notifyStreakRewardToAdmins(b.userId),
       ]),
     );
   }

@@ -13,6 +13,29 @@ import {
 import { requireAuth } from '../middleware/jwt';
 import { requireAdmin, requireStaff } from '../middleware/rbac';
 import { computeUserScoring } from '../services/scoring.service';
+import { analyzeFinances } from '../services/agent.service';
+
+const TZ = 'America/Bogota';
+
+// Desglose financiero por mes (últimos 12), agrupado en JS para no depender del driver.
+async function buildFinanzas() {
+  const rows = await db
+    .select({ monto: payments.montoCop, estado: payments.estado, metodo: payments.metodo, createdAt: payments.createdAt })
+    .from(payments);
+  const map = new Map<string, { mes: string; ingresos: number; pagos: number; pendiente: number; pendientes: number }>();
+  let totalIngresos = 0;
+  let totalPendiente = 0;
+  let totalPendientes = 0;
+  for (const r of rows) {
+    const mes = format(toZonedTime(r.createdAt as Date, TZ), 'yyyy-MM');
+    const m = map.get(mes) ?? { mes, ingresos: 0, pagos: 0, pendiente: 0, pendientes: 0 };
+    if (r.estado === 'exitoso') { m.ingresos += r.monto; m.pagos += 1; totalIngresos += r.monto; }
+    if (r.estado === 'pendiente') { m.pendiente += r.monto; m.pendientes += 1; totalPendiente += r.monto; totalPendientes += 1; }
+    map.set(mes, m);
+  }
+  const meses = [...map.values()].sort((a, b) => (a.mes < b.mes ? 1 : -1)).slice(0, 12);
+  return { meses, totales: { ingresos: totalIngresos, pendiente: totalPendiente, pendientes: totalPendientes } };
+}
 
 export const statsRouter = new Hono();
 statsRouter.use('*', requireAuth);
@@ -140,4 +163,17 @@ statsRouter.get('/admin/overview', requireAdmin, async (c) => {
     ingresosMesCop: Number(ingresosMes[0]?.total ?? 0),
     clasesHoy: clasesHoy[0]?.n ?? 0,
   });
+});
+
+// Análisis financiero (admin): datos por mes + totales
+statsRouter.get('/finanzas', requireAdmin, async (c) => {
+  const data = await buildFinanzas();
+  return c.json(data);
+});
+
+// Conclusiones del agente IA sobre las finanzas
+statsRouter.get('/finanzas/analisis', requireAdmin, async (c) => {
+  const data = await buildFinanzas();
+  const analisis = await analyzeFinances(data.meses);
+  return c.json({ analisis });
 });

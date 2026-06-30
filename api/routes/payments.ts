@@ -228,9 +228,24 @@ paymentsRouter.patch('/:id', requireStaff, zValidator('json', updatePaymentSchem
         await tx.update(userPlans).set({ estado: 'activo' }).where(eq(userPlans.id, p.userPlanId));
       }
     });
+
+    // Nombre del plan (si el pago va ligado a uno) para la notificación de agradecimiento
+    let planNombre = '';
+    if (p.userPlanId) {
+      const [pl] = await db
+        .select({ nombre: planTypes.nombre })
+        .from(userPlans)
+        .innerJoin(planTypes, eq(userPlans.planTypeId, planTypes.id))
+        .where(eq(userPlans.id, p.userPlanId))
+        .limit(1);
+      planNombre = pl?.nombre ?? '';
+    }
+    const monto = `$${p.montoCop.toLocaleString('es-CO')} COP`;
     await notifyUser(p.userId, {
-      title: 'Pago confirmado',
-      body: `Tu pago de $${p.montoCop.toLocaleString('es-CO')} COP quedó registrado.`,
+      title: '¡Gracias por tu pago!',
+      body: planNombre
+        ? `Tu pago de ${monto} por el plan ${planNombre} quedó registrado. ¡Nos vemos en el entreno!`
+        : `Tu pago de ${monto} quedó registrado. ¡Gracias!`,
       url: '/app/pagos',
     }, { tipo: 'pago_ok' });
   } else {

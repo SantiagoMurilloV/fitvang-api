@@ -15,6 +15,7 @@ import { statsRouter } from './routes/stats';
 import { jobsRouter } from './routes/jobs';
 import { uploadRouter } from './routes/upload';
 import { configRouter } from './routes/config';
+import { agentRouter } from './routes/agent';
 import { globalLimit } from './middleware/rateLimit';
 import { fetchWithTimeout } from './lib/http';
 import { db } from './db/client';
@@ -87,6 +88,7 @@ app.route('/stats', statsRouter);
 app.route('/jobs', jobsRouter);
 app.route('/upload', uploadRouter);
 app.route('/config', configRouter);
+app.route('/agent', agentRouter);
 
 app.notFound((c) => c.json({ error: 'not_found', path: c.req.path }, 404));
 app.onError((err, c) => {

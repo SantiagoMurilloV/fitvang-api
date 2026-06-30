@@ -62,6 +62,9 @@ export const env = {
   PUBLIC_APP_URL: process.env.PUBLIC_APP_URL ?? 'http://localhost:4321',
   ALERT_WEBHOOK_URL: optionalUrl('ALERT_WEBHOOK_URL'),
   APP_TIMEZONE: process.env.APP_TIMEZONE ?? 'America/Bogota',
+  // ── IA (agente Vango): proveedores OpenAI-compatibles ──
+  GROQ_API_KEY: process.env.GROQ_API_KEY ?? '',
+  DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY ?? '',
   IS_PROD,
 };
 

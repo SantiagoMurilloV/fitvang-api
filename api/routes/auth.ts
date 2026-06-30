@@ -114,10 +114,12 @@ authRouter.get('/me', requireAuth, async (c) => {
       avatarUrl: users.avatarUrl,
       esMenor: users.esMenor,
       esAcudiente: users.esAcudiente,
+      terminosAceptadosAt: users.terminosAceptadosAt,
     })
     .from(users)
     .where(eq(users.id, u.sub))
     .limit(1);
   if (!rows[0]) return c.json({ error: 'not_found' }, 404);
-  return c.json({ user: rows[0] });
+  const { terminosAceptadosAt, ...rest } = rows[0];
+  return c.json({ user: { ...rest, terminosAceptados: !!terminosAceptadosAt } });
 });
