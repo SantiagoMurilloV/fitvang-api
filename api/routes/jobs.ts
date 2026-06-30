@@ -7,11 +7,11 @@
 
 import { Hono } from 'hono';
 import { timingSafeEqual } from 'node:crypto';
-import { eq, and, gt, inArray, sql } from 'drizzle-orm';
+import { eq, and, gt, lte, inArray, sql } from 'drizzle-orm';
 import { format, addDays } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 import { db } from '../db/client';
-import { users, userPlans, planTypes, notifications, bookings, classSessions } from '../db/schema';
+import { users, userPlans, planTypes, payments, notifications, bookings, classSessions } from '../db/schema';
 import { env } from '../lib/env';
 import { notifyUser } from '../services/webpush.service';
 import { businessDaysSince } from '../lib/colombianHolidays';
@@ -249,8 +249,50 @@ jobsRouter.post('/vencimiento', async (c) => {
       notified++;
     }
 
-    console.log(`[job/vencimiento] Notificados: ${notified}, Saltados: ${skipped}`);
-    return c.json({ ok: true, notified, skipped, target });
+    // ── Auto-renovación: planes con renovación automática que ya vencieron ──
+    const todayStr = format(now, 'yyyy-MM-dd');
+    let renewed = 0;
+    const toRenew = await db
+      .select({
+        planId: userPlans.id,
+        userId: userPlans.userId,
+        precio: userPlans.precioCopAplicado,
+        planGroupId: userPlans.planGroupId,
+        duracionDias: planTypes.duracionDias,
+        planNombre: planTypes.nombre,
+      })
+      .from(userPlans)
+      .innerJoin(planTypes, eq(userPlans.planTypeId, planTypes.id))
+      .where(and(
+        eq(userPlans.estado, 'activo'),
+        eq(userPlans.renovacionAutomatica, true),
+        lte(userPlans.fechaFin, todayStr),
+      ));
+
+    for (const p of toRenew) {
+      const nuevoFin = format(addDays(now, p.duracionDias), 'yyyy-MM-dd');
+      await db.transaction(async (tx) => {
+        await tx.update(userPlans).set({ fechaFin: nuevoFin, updatedAt: new Date() }).where(eq(userPlans.id, p.planId));
+        await tx.insert(payments).values({
+          userId: p.userId,
+          userPlanId: p.planId,
+          planGroupId: p.planGroupId,
+          montoCop: p.precio,
+          metodo: 'efectivo',
+          estado: 'pendiente',
+          notas: 'Renovación automática',
+        });
+      });
+      await notifyUser(p.userId, {
+        title: 'Tu plan se renovó automáticamente',
+        body: `Tu ${p.planNombre} se renovó hasta el ${nuevoFin}. Queda un pago pendiente por confirmar.`,
+        url: '/app/pagos',
+      }, { tipo: 'sistema', dedupeKey: `autorenew-${p.planId}-${nuevoFin}` });
+      renewed++;
+    }
+
+    console.log(`[job/vencimiento] Notificados: ${notified}, Saltados: ${skipped}, Renovados: ${renewed}`);
+    return c.json({ ok: true, notified, skipped, renewed, target });
   } catch (err) {
     console.error('[job/vencimiento] Error:', err);
     return c.json({ ok: false, error: String(err) }, 500);

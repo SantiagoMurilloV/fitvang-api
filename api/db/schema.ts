@@ -31,7 +31,7 @@ export const weekdayEnum = pgEnum('weekday', ['lunes', 'martes', 'miercoles', 'j
 export const sessionStatusEnum = pgEnum('session_status', ['programada', 'en_progreso', 'finalizada', 'cancelada']);
 export const bookingStatusEnum = pgEnum('booking_status', ['activa', 'cancelada', 'no_asistio', 'asistio']);
 export const cancelledByEnum = pgEnum('cancelled_by', ['usuario', 'sistema', 'admin', 'coach']);
-export const paymentMethodEnum = pgEnum('payment_method', ['wompi_card', 'wompi_nequi', 'wompi_pse', 'efectivo']);
+export const paymentMethodEnum = pgEnum('payment_method', ['wompi_card', 'wompi_nequi', 'wompi_pse', 'efectivo', 'transferencia']);
 export const paymentStatusEnum = pgEnum('payment_status', ['pendiente', 'exitoso', 'fallido', 'reembolsado']);
 export const notificationTypeEnum = pgEnum('notification_type', [
   'asistencia',
@@ -181,6 +181,7 @@ export const userPlans = pgTable(
     sesionesTotales: integer('sesiones_totales'),
     sesionesUsadas: integer('sesiones_usadas').notNull().default(0),
     estado: userPlanStatusEnum('estado').notNull().default('activo'),
+    renovacionAutomatica: boolean('renovacion_automatica').notNull().default(false),
     creadoPor: uuid('creado_por').references(() => users.id, { onDelete: 'set null' }),
     notasAdmin: text('notas_admin'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),

@@ -286,6 +286,7 @@ usersRouter.get('/:id/ficha', async (c) => {
       fechaInicio: userPlans.fechaInicio,
       fechaFin: userPlans.fechaFin,
       estado: userPlans.estado,
+      renovacionAutomatica: userPlans.renovacionAutomatica,
     })
     .from(userPlans)
     .innerJoin(planTypes, eq(userPlans.planTypeId, planTypes.id))

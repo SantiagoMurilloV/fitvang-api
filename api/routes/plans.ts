@@ -65,21 +65,25 @@ plansRouter.delete('/types/:id', requireAdmin, async (c) => {
 });
 
 // Asignar plan a usuario
+const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const assignSchema = z.object({
   userId: z.string().uuid(),
   planTypeId: z.string().uuid(),
   planGroupId: z.string().uuid().optional(),
   precioCopAplicado: z.number().int().positive().max(100_000_000).optional(),
   notasAdmin: z.string().trim().max(500).optional(),
+  fechaInicio: dateStr.optional(),
+  fechaFin: dateStr.optional(),
+  renovacionAutomatica: z.boolean().optional(),
 });
 plansRouter.post('/assign', requireAdmin, zValidator('json', assignSchema), async (c) => {
   const me = c.get('user');
   const body = c.req.valid('json');
   const pt = await db.select().from(planTypes).where(eq(planTypes.id, body.planTypeId)).limit(1);
   if (!pt[0]) return c.json({ error: 'plan_no_encontrado' }, 404);
-  const today = new Date();
-  const fechaInicio = format(today, 'yyyy-MM-dd');
-  const fechaFin = format(addDays(today, pt[0].duracionDias), 'yyyy-MM-dd');
+  const startDate = body.fechaInicio ? new Date(body.fechaInicio + 'T12:00:00') : new Date();
+  const fechaInicio = format(startDate, 'yyyy-MM-dd');
+  const fechaFin = body.fechaFin ?? format(addDays(startDate, pt[0].duracionDias), 'yyyy-MM-dd');
   const precio = body.precioCopAplicado ?? pt[0].precioBaseCop;
 
   // Multi-plan: un usuario puede tener varios planes activos a la vez. Solo se
@@ -105,6 +109,7 @@ plansRouter.post('/assign', requireAdmin, zValidator('json', assignSchema), asyn
         fechaInicio,
         fechaFin,
         estado: 'activo',
+        renovacionAutomatica: body.renovacionAutomatica ?? false,
         creadoPor: me.sub,
         notasAdmin: body.notasAdmin,
       })
@@ -134,9 +139,61 @@ plansRouter.delete('/assign/:id', requireAdmin, async (c) => {
   const id = c.req.param('id');
   await db.transaction(async (tx) => {
     await tx.update(userPlans).set({ estado: 'cancelado' }).where(eq(userPlans.id, id));
+    // Solo borra el cargo PENDIENTE (nunca pagos exitosos: el historial se conserva).
     await tx.delete(payments).where(and(eq(payments.userPlanId, id), eq(payments.estado, 'pendiente')));
   });
   return c.json({ ok: true });
+});
+
+// Editar un plan asignado: fechas y modo de renovación (auto/manual).
+const editAssignSchema = z.object({
+  fechaInicio: dateStr.optional(),
+  fechaFin: dateStr.optional(),
+  renovacionAutomatica: z.boolean().optional(),
+});
+plansRouter.patch('/assign/:id', requireAdmin, zValidator('json', editAssignSchema), async (c) => {
+  const id = c.req.param('id');
+  const body = c.req.valid('json');
+  const set: Record<string, unknown> = { updatedAt: new Date() };
+  if (body.fechaInicio !== undefined) set.fechaInicio = body.fechaInicio;
+  if (body.fechaFin !== undefined) set.fechaFin = body.fechaFin;
+  if (body.renovacionAutomatica !== undefined) set.renovacionAutomatica = body.renovacionAutomatica;
+  await db.update(userPlans).set(set).where(eq(userPlans.id, id));
+  return c.json({ ok: true });
+});
+
+// Renovar manualmente: extiende la vigencia un periodo y genera un cargo pendiente.
+plansRouter.post('/assign/:id/renew', requireAdmin, async (c) => {
+  const me = c.get('user');
+  const id = c.req.param('id');
+  const rows = await db
+    .select({ up: userPlans, duracionDias: planTypes.duracionDias })
+    .from(userPlans)
+    .innerJoin(planTypes, eq(userPlans.planTypeId, planTypes.id))
+    .where(eq(userPlans.id, id))
+    .limit(1);
+  const r = rows[0];
+  if (!r) return c.json({ error: 'not_found' }, 404);
+
+  // Nuevo periodo: arranca al día siguiente del fin actual (o hoy si ya venció)
+  const finActual = new Date(r.up.fechaFin + 'T12:00:00');
+  const base = finActual.getTime() > Date.now() ? finActual : new Date();
+  const nuevoFin = format(addDays(base, r.duracionDias), 'yyyy-MM-dd');
+
+  await db.transaction(async (tx) => {
+    await tx.update(userPlans).set({ estado: 'activo', fechaFin: nuevoFin, updatedAt: new Date() }).where(eq(userPlans.id, id));
+    await tx.insert(payments).values({
+      userId: r.up.userId,
+      userPlanId: id,
+      planGroupId: r.up.planGroupId,
+      montoCop: r.up.precioCopAplicado,
+      metodo: 'efectivo',
+      estado: 'pendiente',
+      registradoPor: me.sub,
+      notas: 'Renovación de plan',
+    });
+  });
+  return c.json({ ok: true, fechaFin: nuevoFin });
 });
 
 // Mi plan activo

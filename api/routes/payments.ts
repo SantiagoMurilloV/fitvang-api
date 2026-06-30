@@ -203,34 +203,43 @@ paymentsRouter.get('/', requireStaff, async (c) => {
   return c.json({ payments: rows, limit, offset });
 });
 
-// Marcar un pago pendiente como pagado (efectivo / Wompi manual). Solo staff.
-const markPaidSchema = z.object({
-  metodo: z.enum(['efectivo', 'wompi_card', 'wompi_nequi', 'wompi_pse']).default('efectivo'),
+// Cambiar el estado de un pago (solo staff): marcar pagado o devolver a pendiente
+// (por si se marcó por error). metodo solo aplica al marcar pagado.
+const updatePaymentSchema = z.object({
+  estado: z.enum(['pendiente', 'exitoso']),
+  metodo: z.enum(['efectivo', 'transferencia', 'wompi_card', 'wompi_nequi', 'wompi_pse']).optional(),
 });
-paymentsRouter.patch('/:id', requireStaff, zValidator('json', markPaidSchema), async (c) => {
+paymentsRouter.patch('/:id', requireStaff, zValidator('json', updatePaymentSchema), async (c) => {
   const me = c.get('user');
   const id = c.req.param('id');
   const body = c.req.valid('json');
   const rows = await db.select().from(payments).where(eq(payments.id, id)).limit(1);
   const p = rows[0];
   if (!p) return c.json({ error: 'not_found' }, 404);
-  if (p.estado === 'exitoso') return c.json({ ok: true }); // ya estaba pagado
+  if (p.estado === body.estado) return c.json({ ok: true }); // sin cambios
 
-  await db.transaction(async (tx) => {
-    await tx
+  if (body.estado === 'exitoso') {
+    await db.transaction(async (tx) => {
+      await tx
+        .update(payments)
+        .set({ estado: 'exitoso', metodo: body.metodo ?? p.metodo, registradoPor: me.sub, updatedAt: new Date() })
+        .where(eq(payments.id, id));
+      if (p.userPlanId) {
+        await tx.update(userPlans).set({ estado: 'activo' }).where(eq(userPlans.id, p.userPlanId));
+      }
+    });
+    await notifyUser(p.userId, {
+      title: 'Pago confirmado',
+      body: `Tu pago de $${p.montoCop.toLocaleString('es-CO')} COP quedó registrado.`,
+      url: '/app/pagos',
+    }, { tipo: 'pago_ok' });
+  } else {
+    // Revertir a pendiente (corrección de un error)
+    await db
       .update(payments)
-      .set({ estado: 'exitoso', metodo: body.metodo, registradoPor: me.sub, updatedAt: new Date() })
+      .set({ estado: 'pendiente', updatedAt: new Date() })
       .where(eq(payments.id, id));
-    if (p.userPlanId) {
-      await tx.update(userPlans).set({ estado: 'activo' }).where(eq(userPlans.id, p.userPlanId));
-    }
-  });
-
-  await notifyUser(p.userId, {
-    title: 'Pago confirmado',
-    body: `Tu pago de $${p.montoCop.toLocaleString('es-CO')} COP quedó registrado.`,
-    url: '/app/pagos',
-  }, { tipo: 'pago_ok' });
+  }
 
   return c.json({ ok: true });
 });
