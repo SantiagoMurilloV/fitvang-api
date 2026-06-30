@@ -32,7 +32,16 @@ const createUserSchema = z.object({
 usersRouter.get('/', requireStaff, async (c) => {
   const q = c.req.query('q')?.toLowerCase();
   const rol = c.req.query('rol') as 'super_admin' | 'coach' | 'user' | undefined;
-  let rows = await db
+  const limit = Math.min(Math.max(Number(c.req.query('limit') ?? 50), 1), 100);
+  const offset = Math.max(Number(c.req.query('offset') ?? 0), 0);
+
+  // Filtros aplicados en la BD (rol ya no se filtra en memoria)
+  const conditions = [];
+  if (q) conditions.push(or(ilike(users.nombreCompleto, `%${q}%`), ilike(users.email, `%${q}%`), ilike(users.documento, `%${q}%`)));
+  if (rol) conditions.push(eq(users.rol, rol));
+  const where = conditions.length ? and(...conditions) : undefined;
+
+  const rows = await db
     .select({
       id: users.id,
       nombre: users.nombreCompleto,
@@ -47,15 +56,11 @@ usersRouter.get('/', requireStaff, async (c) => {
       createdAt: users.createdAt,
     })
     .from(users)
-    .where(
-      q
-        ? or(ilike(users.nombreCompleto, `%${q}%`), ilike(users.email, `%${q}%`), ilike(users.documento, `%${q}%`))
-        : undefined,
-    )
+    .where(where)
     .orderBy(desc(users.createdAt))
-    .limit(200);
-  if (rol) rows = rows.filter((r) => r.rol === rol);
-  return c.json({ users: rows });
+    .limit(limit)
+    .offset(offset);
+  return c.json({ users: rows, limit, offset });
 });
 
 // CREATE (admin)
@@ -165,10 +170,32 @@ usersRouter.get('/:id', async (c) => {
   const id = c.req.param('id');
   const guard = checkSelf(c, id);
   if (guard) return guard;
-  const rows = await db.select().from(users).where(eq(users.id, id)).limit(1);
+  // Proyección explícita: passwordHash nunca sale de la BB.DD.
+  const rows = await db
+    .select({
+      id: users.id,
+      nombreCompleto: users.nombreCompleto,
+      documento: users.documento,
+      email: users.email,
+      telefono: users.telefono,
+      rol: users.rol,
+      avatarUrl: users.avatarUrl,
+      fechaNacimiento: users.fechaNacimiento,
+      genero: users.genero,
+      esMenor: users.esMenor,
+      esAcudiente: users.esAcudiente,
+      pesoKg: users.pesoKg,
+      alturaCm: users.alturaCm,
+      bio: users.bio,
+      activo: users.activo,
+      createdAt: users.createdAt,
+      updatedAt: users.updatedAt,
+    })
+    .from(users)
+    .where(eq(users.id, id))
+    .limit(1);
   if (!rows[0]) return c.json({ error: 'not_found' }, 404);
-  const { passwordHash, ...safe } = rows[0];
-  return c.json({ user: safe });
+  return c.json({ user: rows[0] });
 });
 
 // UPDATE

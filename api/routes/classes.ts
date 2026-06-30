@@ -121,11 +121,28 @@ classesRouter.delete('/templates/:id', requireAdmin, async (c) => {
   return c.json({ ok: true });
 });
 
+// Whitelist explícita de columnas editables — evita mass assignment (antes se
+// hacía set(rest as any) con cualquier campo del body sin validar).
+const templatePatchSchema = z.object({
+  nombre: z.string().trim().min(2).max(100),
+  trainingTypeId: z.string().uuid(),
+  coachId: z.string().uuid().nullable(),
+  diaSemana: z.enum(DIAS),
+  horaInicio: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
+  horaFin: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
+  capacidadMax: z.number().int().positive().max(500),
+  activo: z.boolean(),
+}).partial();
+
 classesRouter.patch('/templates/:id', requireAdmin, async (c) => {
-  const body = await c.req.json() as Record<string, unknown>;
+  const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const { planIds, ...rest } = body;
   if (Object.keys(rest).length) {
-    await db.update(classTemplates).set(rest as any).where(eq(classTemplates.id, c.req.param('id')));
+    const parsed = templatePatchSchema.safeParse(rest);
+    if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
+    if (Object.keys(parsed.data).length) {
+      await db.update(classTemplates).set(parsed.data).where(eq(classTemplates.id, c.req.param('id')));
+    }
   }
   if (Array.isArray(planIds)) {
     await db.delete(classTemplatePlans).where(eq(classTemplatePlans.templateId, c.req.param('id')));
@@ -177,16 +194,24 @@ classesRouter.post('/sessions/:id/cancel', requireStaff, async (c) => {
   const { motivo } = await c.req.json().catch(() => ({ motivo: undefined }));
   const sessionId = c.req.param('id');
 
-  await db
-    .update(classSessions)
-    .set({ estado: 'cancelada', cancelacionMotivo: motivo, canceladaPor: me.sub })
-    .where(eq(classSessions.id, sessionId));
-
-  // Notificar a todos los usuarios con reserva activa
+  // Usuarios a notificar (capturados antes de cancelar sus reservas)
   const activeBookings = await db
     .select({ userId: bookings.userId })
     .from(bookings)
     .where(and(eq(bookings.sessionId, sessionId), eq(bookings.estado, 'activa')));
+
+  // Cancelar la sesión y sus reservas activas de forma atómica:
+  // antes los bookings quedaban 'activa' apuntando a una sesión cancelada.
+  await db.transaction(async (tx) => {
+    await tx
+      .update(classSessions)
+      .set({ estado: 'cancelada', cancelacionMotivo: motivo, canceladaPor: me.sub })
+      .where(eq(classSessions.id, sessionId));
+    await tx
+      .update(bookings)
+      .set({ estado: 'cancelada', canceladaPor: me.rol === 'coach' ? 'coach' : 'admin', canceladaAt: new Date() })
+      .where(and(eq(bookings.sessionId, sessionId), eq(bookings.estado, 'activa')));
+  });
 
   await Promise.all(
     activeBookings.map((b) =>

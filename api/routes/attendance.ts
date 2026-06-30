@@ -40,18 +40,20 @@ attendanceRouter.post('/mark', zValidator('json', markSchema), async (c) => {
 
   if (!rows[0]) return c.json({ error: 'booking_not_found' }, 404);
 
-  await db
-    .insert(attendances)
-    .values({ bookingId, presente, marcadoPor: me.sub })
-    .onConflictDoUpdate({
-      target: attendances.bookingId,
-      set: { presente, marcadoPor: me.sub, marcadoAt: new Date() },
-    });
-
-  await db
-    .update(bookings)
-    .set({ estado: presente ? 'asistio' : 'no_asistio' })
-    .where(eq(bookings.id, bookingId));
+  // Asistencia + estado del booking de forma atómica
+  await db.transaction(async (tx) => {
+    await tx
+      .insert(attendances)
+      .values({ bookingId, presente, marcadoPor: me.sub })
+      .onConflictDoUpdate({
+        target: attendances.bookingId,
+        set: { presente, marcadoPor: me.sub, marcadoAt: new Date() },
+      });
+    await tx
+      .update(bookings)
+      .set({ estado: presente ? 'asistio' : 'no_asistio' })
+      .where(eq(bookings.id, bookingId));
+  });
 
   if (presente) {
     const hora = rows[0].horaInicio.slice(0, 5);
@@ -89,35 +91,35 @@ attendanceRouter.post('/bulk', zValidator('json', bulkSchema), async (c) => {
     .from(bookings)
     .where(and(eq(bookings.sessionId, sessionId), inArray(bookings.estado, ['activa', 'asistio', 'no_asistio'])));
 
-  const errors: string[] = [];
-  for (const b of bks) {
-    try {
-      await db
-        .insert(attendances)
-        .values({ bookingId: b.id, presente, marcadoPor: me.sub })
-        .onConflictDoUpdate({
-          target: attendances.bookingId,
-          set: { presente, marcadoPor: me.sub, marcadoAt: new Date() },
-        });
-      await db
-        .update(bookings)
-        .set({ estado: presente ? 'asistio' : 'no_asistio' })
-        .where(eq(bookings.id, b.id));
-    } catch (err) {
-      console.error('[attendance] bulk mark error for booking', b.id, err);
-      errors.push(b.id);
-    }
-  }
+  if (bks.length === 0) return c.json({ marked: 0 });
+
+  const ids = bks.map((b) => b.id);
+  const estado = presente ? 'asistio' : 'no_asistio';
+
+  // Batch + atómico: 2 statements (insert masivo + update por inArray) en vez de
+  // 2 queries por booking. Si falla, no quedan asistencias a medias.
+  await db.transaction(async (tx) => {
+    await tx
+      .insert(attendances)
+      .values(bks.map((b) => ({ bookingId: b.id, presente, marcadoPor: me.sub })))
+      .onConflictDoUpdate({
+        target: attendances.bookingId,
+        set: { presente, marcadoPor: me.sub, marcadoAt: new Date() },
+      });
+    await tx.update(bookings).set({ estado }).where(inArray(bookings.id, ids));
+  });
 
   if (presente) {
-    for (const b of bks) {
-      notifyUser(b.userId, {
-        title: '¡Asistencia registrada!',
-        body: `Tu asistencia fue marcada por ${me.nombre}.`,
-        url: '/app/asistencias',
-      }, { tipo: 'asistencia' }).catch(() => {});
-      persistScoring(b.userId).catch(() => {});
-    }
+    await Promise.allSettled(
+      bks.flatMap((b) => [
+        notifyUser(b.userId, {
+          title: '¡Asistencia registrada!',
+          body: `Tu asistencia fue marcada por ${me.nombre}.`,
+          url: '/app/asistencias',
+        }, { tipo: 'asistencia' }),
+        persistScoring(b.userId),
+      ]),
+    );
   }
-  return c.json({ marked: bks.length - errors.length, errors: errors.length > 0 ? errors : undefined });
+  return c.json({ marked: bks.length });
 });

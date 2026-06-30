@@ -82,27 +82,31 @@ plansRouter.post('/assign', requireAdmin, zValidator('json', assignSchema), asyn
   const fechaFin = format(addDays(today, pt[0].duracionDias), 'yyyy-MM-dd');
   const precio = body.precioCopAplicado ?? pt[0].precioBaseCop;
 
-  // Pausar/expirar planes activos anteriores del mismo training
-  await db
-    .update(userPlans)
-    .set({ estado: 'cancelado' })
-    .where(and(eq(userPlans.userId, body.userId), eq(userPlans.estado, 'activo')));
+  // Cancelar planes activos previos + crear el nuevo de forma atómica:
+  // evita dejar al usuario con dos planes activos o con ninguno si algo falla.
+  const userPlanId = await db.transaction(async (tx) => {
+    await tx
+      .update(userPlans)
+      .set({ estado: 'cancelado' })
+      .where(and(eq(userPlans.userId, body.userId), eq(userPlans.estado, 'activo')));
 
-  const [row] = await db
-    .insert(userPlans)
-    .values({
-      userId: body.userId,
-      planTypeId: body.planTypeId,
-      planGroupId: body.planGroupId,
-      precioCopAplicado: precio,
-      fechaInicio,
-      fechaFin,
-      estado: 'activo',
-      creadoPor: me.sub,
-      notasAdmin: body.notasAdmin,
-    })
-    .returning({ id: userPlans.id });
-  return c.json({ userPlanId: row.id, fechaFin });
+    const [row] = await tx
+      .insert(userPlans)
+      .values({
+        userId: body.userId,
+        planTypeId: body.planTypeId,
+        planGroupId: body.planGroupId,
+        precioCopAplicado: precio,
+        fechaInicio,
+        fechaFin,
+        estado: 'activo',
+        creadoPor: me.sub,
+        notasAdmin: body.notasAdmin,
+      })
+      .returning({ id: userPlans.id });
+    return row.id;
+  });
+  return c.json({ userPlanId, fechaFin });
 });
 
 // Mi plan activo

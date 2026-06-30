@@ -16,8 +16,18 @@ import { eq } from 'drizzle-orm';
 // ---------------------------------------------------------------------------
 
 const SUPER_ADMIN_EMAIL = process.env.SEED_SUPER_ADMIN_EMAIL ?? 'admin@fitvang.com';
-const SUPER_ADMIN_PASSWORD = process.env.SEED_SUPER_ADMIN_PASSWORD ?? 'Fitvang2026!';
 const SUPER_ADMIN_DOCUMENTO = process.env.SEED_SUPER_ADMIN_DOCUMENTO ?? '00000000';
+
+// Sin fallback por seguridad: si no se define, el seed no corre.
+const SUPER_ADMIN_PASSWORD: string = (() => {
+  const v = process.env.SEED_SUPER_ADMIN_PASSWORD;
+  if (!v) {
+    throw new Error(
+      'SEED_SUPER_ADMIN_PASSWORD es obligatorio. Define una contraseña fuerte antes de sembrar.',
+    );
+  }
+  return v;
+})();
 
 const TRAINING_TYPES = [
   {
@@ -127,7 +137,7 @@ async function main() {
       })
       .returning({ id: users.id });
     adminId = admin.id;
-    console.log(`  ✓ super_admin creado (${SUPER_ADMIN_EMAIL} / ${SUPER_ADMIN_PASSWORD})`);
+    console.log(`  ✓ super_admin creado (${SUPER_ADMIN_EMAIL} / contraseña oculta — usa SEED_SUPER_ADMIN_PASSWORD)`);
   }
 
   // 3) Training Types

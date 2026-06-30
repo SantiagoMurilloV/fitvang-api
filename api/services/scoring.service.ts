@@ -171,12 +171,18 @@ export async function computeUserScoring(userId: string, mes?: string): Promise<
   const asistencias = rows.filter((r) => r.estado === 'asistio').length;
   const porcentaje = totalSesiones === 0 ? 0 : Math.round((asistencias / totalSesiones) * 100);
 
-  // Para la racha necesitamos TODOS los días históricos asistidos, no solo del mes
+  // Para la racha necesitamos los días asistidos, pero acotados al último año:
+  // la racha máxima por semanas casi nunca requiere más historial y evita cargar
+  // miles de filas por usuario antiguo en cada marcación de asistencia.
   const allAttended = await db
     .select({ fecha: classSessions.fecha })
     .from(bookings)
     .innerJoin(classSessions, eq(bookings.sessionId, classSessions.id))
-    .where(and(eq(bookings.userId, userId), eq(bookings.estado, 'asistio')));
+    .where(and(
+      eq(bookings.userId, userId),
+      eq(bookings.estado, 'asistio'),
+      gte(classSessions.fecha, sql`(CURRENT_DATE - 370)::date::text`),
+    ));
 
   const attendedDays = allAttended.map((r) => r.fecha);
   const { rachaActual, rachaMaxima } = computeStreakFromDays(attendedDays);

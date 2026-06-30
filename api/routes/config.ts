@@ -1,4 +1,6 @@
 import { Hono } from 'hono';
+import { zValidator } from '@hono/zod-validator';
+import { z } from 'zod';
 import { eq } from 'drizzle-orm';
 import { db } from '../db/client';
 import { clubConfig, type RolePermissions } from '../db/schema';
@@ -7,6 +9,21 @@ import { requireAdmin } from '../middleware/rbac';
 
 export const configRouter = new Hono();
 configRouter.use('*', requireAuth);
+
+// Valida la estructura exacta de RolePermissions en runtime (antes solo se
+// casteaba el JSON, permitiendo escribir estructura arbitraria en el JSONB).
+const roleSchema = z.object({
+  secciones: z.record(z.boolean()),
+  acciones: z.record(z.boolean()),
+  notificaciones: z.record(z.boolean()),
+  limites: z.record(z.number().int().nullable()),
+});
+const permisosSchema = z.object({
+  user: roleSchema,
+  coach: roleSchema,
+  menor: roleSchema,
+  acudiente: roleSchema,
+});
 
 const DEFAULT_PERMISOS: RolePermissions = {
   user: {
@@ -106,8 +123,8 @@ configRouter.get('/permisos', requireAdmin, async (c) => {
   return c.json({ permisos });
 });
 
-configRouter.patch('/permisos', requireAdmin, async (c) => {
-  const body = await c.req.json<RolePermissions>();
+configRouter.patch('/permisos', requireAdmin, zValidator('json', permisosSchema), async (c) => {
+  const body = c.req.valid('json') as RolePermissions;
   await db
     .insert(clubConfig)
     .values({ id: 1, permisos: body })

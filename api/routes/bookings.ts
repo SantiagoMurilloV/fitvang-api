@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import { z } from 'zod';
-import { eq, and, desc, sql, inArray, gte } from 'drizzle-orm';
+import { eq, and, sql, inArray, gte, gt } from 'drizzle-orm';
 import { db } from '../db/client';
 import {
   bookings,
@@ -166,19 +166,37 @@ bookingsRouter.post('/', zValidator('json', createSchema), async (c) => {
     .limit(1);
   if (dup[0]) return c.json({ error: 'ya_reservada' }, 409);
 
-  // 5. Cupos
+  // 5. Límite de sesiones del plan (si el plan tiene cupo de sesiones)
+  if (plan.sesionesTotales != null && plan.sesionesUsadas >= plan.sesionesTotales) {
+    return c.json({ error: 'plan_sin_sesiones', message: 'Tu plan no tiene sesiones disponibles.' }, 403);
+  }
+
+  // 6. Cupos
   if (sess.ocupados >= sess.capacidadMax) {
-    // entrar a waitlist
+    // entrar a waitlist (no consume sesión hasta ser promovido)
     const pos = sess.ocupados - sess.capacidadMax + 1;
     await db.insert(waitlist).values({ userId: me.sub, sessionId, posicion: pos }).onConflictDoNothing();
     return c.json({ waitlisted: true, posicion: pos }, 202);
   }
 
-  const [row] = await db
-    .insert(bookings)
-    .values({ userId: me.sub, sessionId, estado: 'activa' })
-    .returning({ id: bookings.id });
-  return c.json({ bookingId: row.id });
+  // Reserva + consumo de una sesión del plan de forma atómica.
+  // onConflictDoUpdate reactiva una reserva previamente cancelada (mismo userId+sessionId).
+  const bookingId = await db.transaction(async (tx) => {
+    const [row] = await tx
+      .insert(bookings)
+      .values({ userId: me.sub, sessionId, estado: 'activa' })
+      .onConflictDoUpdate({
+        target: [bookings.userId, bookings.sessionId],
+        set: { estado: 'activa', canceladaPor: null, canceladaAt: null, fechaReserva: new Date() },
+      })
+      .returning({ id: bookings.id });
+    await tx
+      .update(userPlans)
+      .set({ sesionesUsadas: sql`${userPlans.sesionesUsadas} + 1` })
+      .where(eq(userPlans.id, plan.userPlanId));
+    return row.id;
+  });
+  return c.json({ bookingId });
 });
 
 // Cancelar reserva
@@ -208,22 +226,57 @@ bookingsRouter.post('/:id/cancel', async (c) => {
   const horasFalta = (sessAt.getTime() - Date.now()) / 36e5;
   const fueraDeVentana = horasFalta < horasMin;
 
-  await db
-    .update(bookings)
-    .set({ estado: 'cancelada', canceladaPor: me.rol === 'user' ? 'usuario' : me.rol === 'coach' ? 'coach' : 'admin', canceladaAt: new Date() })
-    .where(eq(bookings.id, id));
+  const canceladaPor = me.rol === 'user' ? 'usuario' : me.rol === 'coach' ? 'coach' : 'admin';
+  const consumioSesion = b.booking.estado === 'activa' || b.booking.estado === 'asistio';
 
-  // promover waitlist
-  const wl = await db
-    .select()
-    .from(waitlist)
-    .where(eq(waitlist.sessionId, b.sessionId))
-    .orderBy(waitlist.posicion)
-    .limit(1);
-  if (wl[0]) {
-    await db.delete(waitlist).where(eq(waitlist.id, wl[0].id));
-    await db.insert(bookings).values({ userId: wl[0].userId, sessionId: b.sessionId, estado: 'activa' });
-    notifyUser(wl[0].userId, {
+  let promovido: string | null = null;
+  await db.transaction(async (tx) => {
+    await tx
+      .update(bookings)
+      .set({ estado: 'cancelada', canceladaPor, canceladaAt: new Date() })
+      .where(eq(bookings.id, id));
+
+    // Devolver la sesión al plan activo del usuario (si la reserva la consumía)
+    if (consumioSesion) {
+      await tx
+        .update(userPlans)
+        .set({ sesionesUsadas: sql`GREATEST(0, ${userPlans.sesionesUsadas} - 1)` })
+        .where(and(eq(userPlans.userId, b.booking.userId), eq(userPlans.estado, 'activo')));
+    }
+
+    // Promover al primero de la lista de espera
+    const wl = await tx
+      .select()
+      .from(waitlist)
+      .where(eq(waitlist.sessionId, b.sessionId))
+      .orderBy(waitlist.posicion)
+      .limit(1);
+    if (wl[0]) {
+      await tx.delete(waitlist).where(eq(waitlist.id, wl[0].id));
+      // Reordenar: los que estaban detrás suben una posición (antes quedaban desfasados)
+      await tx
+        .update(waitlist)
+        .set({ posicion: sql`${waitlist.posicion} - 1` })
+        .where(and(eq(waitlist.sessionId, b.sessionId), gt(waitlist.posicion, wl[0].posicion)));
+      // Crear/activar la reserva del promovido
+      await tx
+        .insert(bookings)
+        .values({ userId: wl[0].userId, sessionId: b.sessionId, estado: 'activa' })
+        .onConflictDoUpdate({
+          target: [bookings.userId, bookings.sessionId],
+          set: { estado: 'activa', canceladaPor: null, canceladaAt: null, fechaReserva: new Date() },
+        });
+      // El promovido consume una sesión de su plan activo
+      await tx
+        .update(userPlans)
+        .set({ sesionesUsadas: sql`${userPlans.sesionesUsadas} + 1` })
+        .where(and(eq(userPlans.userId, wl[0].userId), eq(userPlans.estado, 'activo')));
+      promovido = wl[0].userId;
+    }
+  });
+
+  if (promovido) {
+    notifyUser(promovido, {
       title: '¡Hay un cupo para tu clase! 🎉',
       body: 'Pasaste de la lista de espera a confirmado.',
       url: '/app/horarios',

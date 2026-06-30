@@ -6,11 +6,13 @@
 // Los jobs nunca lanzan — loguean y devuelven siempre 200.
 
 import { Hono } from 'hono';
-import { eq, and, gt, desc } from 'drizzle-orm';
+import { timingSafeEqual } from 'node:crypto';
+import { eq, and, gt, inArray, sql } from 'drizzle-orm';
 import { format, addDays } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 import { db } from '../db/client';
 import { users, userPlans, planTypes, notifications, bookings, classSessions } from '../db/schema';
+import { env } from '../lib/env';
 import { notifyUser } from '../services/webpush.service';
 import { businessDaysSince } from '../lib/colombianHolidays';
 import { generateUpcomingSessions, closeFinishedSessions } from '../services/scheduler.service';
@@ -19,15 +21,27 @@ const TZ = 'America/Bogota';
 
 export const jobsRouter = new Hono();
 
+// Comparación en tiempo constante para evitar timing attacks sobre el secret.
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
 // ─── Guard de CRON_SECRET ────────────────────────────────────────────────────
+// En producción env.CRON_SECRET es obligatorio (env.ts falla al arrancar si
+// falta), así que los jobs nunca quedan abiertos. En dev sin secret se permite.
 jobsRouter.use('*', async (c, next) => {
-  const cronSecret = process.env.CRON_SECRET;
-  if (cronSecret) {
-    const auth = c.req.header('Authorization') ?? '';
-    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-    if (token !== cronSecret) {
-      return c.json({ error: 'unauthorized' }, 401);
-    }
+  const cronSecret = env.CRON_SECRET;
+  if (!cronSecret) {
+    if (env.IS_PROD) return c.json({ error: 'cron_not_configured' }, 503);
+    return next(); // dev sin secret: acceso local permitido
+  }
+  const auth = c.req.header('Authorization') ?? '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!safeEqual(token, cronSecret)) {
+    return c.json({ error: 'unauthorized' }, 401);
   }
   return next();
 });
@@ -97,7 +111,7 @@ jobsRouter.post('/inactividad', async (c) => {
   let skipped = 0;
 
   try {
-    // Usuarios activos con plan vigente
+    // Usuarios activos (rol user)
     const activeUsers = await db
       .select({
         id: users.id,
@@ -106,46 +120,56 @@ jobsRouter.post('/inactividad', async (c) => {
       .from(users)
       .where(and(eq(users.activo, true), eq(users.rol, 'user')));
 
+    if (activeUsers.length === 0) {
+      console.log('[job/inactividad] Sin usuarios activos');
+      return c.json({ ok: true, notified: 0, skipped: 0, week: isoWk });
+    }
+
+    const userIds = activeUsers.map((u) => u.id);
+    const dedupeKeys = activeUsers.map((u) => `inactividad-${u.id}-${isoWk}`);
+
+    // 1 query batch: claves ya notificadas esta semana (en vez de 1 por usuario)
+    const sentRows = await db
+      .select({ dedupeKey: notifications.dedupeKey })
+      .from(notifications)
+      .where(inArray(notifications.dedupeKey, dedupeKeys));
+    const alreadySent = new Set(sentRows.map((r) => r.dedupeKey));
+
+    // 1 query batch: última asistencia por usuario (en vez de 1 por usuario)
+    const lastRows = await db
+      .select({
+        userId: bookings.userId,
+        ultima: sql<string | null>`max(${classSessions.fecha})`,
+      })
+      .from(bookings)
+      .innerJoin(classSessions, eq(bookings.sessionId, classSessions.id))
+      .where(and(inArray(bookings.userId, userIds), eq(bookings.estado, 'asistio')))
+      .groupBy(bookings.userId);
+    const lastByUser = new Map(lastRows.map((r) => [r.userId, r.ultima]));
+
+    const tasks: Promise<void>[] = [];
     for (const u of activeUsers) {
       const dedupeKey = `inactividad-${u.id}-${isoWk}`;
+      if (alreadySent.has(dedupeKey)) { skipped++; continue; }
 
-      // ¿Ya notificado esta semana?
-      const alreadySent = await db
-        .select({ id: notifications.id })
-        .from(notifications)
-        .where(eq(notifications.dedupeKey, dedupeKey))
-        .limit(1);
-      if (alreadySent[0]) { skipped++; continue; }
-
-      // Última asistencia
-      const lastRows = await db
-        .select({ fecha: classSessions.fecha })
-        .from(bookings)
-        .innerJoin(classSessions, eq(bookings.sessionId, classSessions.id))
-        .where(and(eq(bookings.userId, u.id), eq(bookings.estado, 'asistio')))
-        .orderBy(desc(classSessions.fecha))
-        .limit(1);
-
-      let daysSince: number;
-      if (!lastRows[0]) {
-        daysSince = 5; // sin asistencias — siempre inactivo
-      } else {
-        daysSince = businessDaysSince(lastRows[0].fecha);
-      }
-
+      const ultima = lastByUser.get(u.id) ?? null;
+      const daysSince = ultima ? businessDaysSince(ultima) : 5; // sin asistencias = inactivo
       if (daysSince < 4) { skipped++; continue; }
 
       const firstName = u.nombre.split(' ')[0] ?? 'campeón';
       const variant = pickMessage(u.id, weekNumber);
 
-      await notifyUser(
-        u.id,
-        { title: variant.title, body: variant.body(firstName, daysSince), url: '/app/horarios' },
-        { tipo: 'asistencia', dedupeKey },
+      tasks.push(
+        notifyUser(
+          u.id,
+          { title: variant.title, body: variant.body(firstName, daysSince), url: '/app/horarios' },
+          { tipo: 'asistencia', dedupeKey },
+        ),
       );
-
       notified++;
     }
+
+    await Promise.allSettled(tasks);
 
     console.log(`[job/inactividad] Notificados: ${notified}, Saltados: ${skipped}`);
     return c.json({ ok: true, notified, skipped, week: isoWk });

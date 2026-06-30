@@ -16,6 +16,7 @@ import { jobsRouter } from './routes/jobs';
 import { uploadRouter } from './routes/upload';
 import { configRouter } from './routes/config';
 import { globalLimit } from './middleware/rateLimit';
+import { fetchWithTimeout } from './lib/http';
 import { db } from './db/client';
 import { sql } from 'drizzle-orm';
 
@@ -62,14 +63,13 @@ app.get('/health', async (c) => {
     return c.json({ status: 'ok', service: 'fitvang-api', db: 'connected', time: new Date().toISOString() });
   } catch (err) {
     console.error('[health] DB check failed:', err);
-    // Alerta al webhook de Discord/Telegram si está configurado
-    const webhookUrl = process.env.ALERT_WEBHOOK_URL;
-    if (webhookUrl) {
-      fetch(webhookUrl, {
+    // Alerta al webhook de Discord/Telegram si está configurado (validado en env.ts)
+    if (env.ALERT_WEBHOOK_URL) {
+      fetchWithTimeout(env.ALERT_WEBHOOK_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content: '🚨 **Fitvang API** — Base de datos no disponible. Health check fallido.' }),
-      }).catch(() => {});
+      }, 3_000).catch(() => {});
     }
     return c.json({ status: 'degraded', service: 'fitvang-api', db: 'error', time: new Date().toISOString() }, 503);
   }
@@ -92,17 +92,14 @@ app.notFound((c) => c.json({ error: 'not_found', path: c.req.path }, 404));
 app.onError((err, c) => {
   console.error('[api error]', err);
   // Alerta Discord en errores 500 en producción
-  if (env.IS_PROD) {
-    const webhookUrl = process.env.ALERT_WEBHOOK_URL;
-    if (webhookUrl) {
-      fetch(webhookUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          content: `🚨 **Fitvang API Error 500**\n\`${err.message}\`\nRuta: \`${c.req.path}\``,
-        }),
-      }).catch(() => {});
-    }
+  if (env.IS_PROD && env.ALERT_WEBHOOK_URL) {
+    fetchWithTimeout(env.ALERT_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: `🚨 **Fitvang API Error 500**\n\`${err.message}\`\nRuta: \`${c.req.path}\``,
+      }),
+    }, 3_000).catch(() => {});
   }
   return c.json({ error: 'internal_error', message: env.IS_PROD ? 'Error interno del servidor' : err.message }, 500);
 });

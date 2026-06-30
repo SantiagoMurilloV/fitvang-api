@@ -16,7 +16,15 @@ notificationsRouter.get('/', async (c) => {
   const me = c.get('user');
   const limit = Number(c.req.query('limit') ?? '50');
   const rows = await db
-    .select()
+    .select({
+      id: notifications.id,
+      tipo: notifications.tipo,
+      titulo: notifications.titulo,
+      mensaje: notifications.mensaje,
+      leida: notifications.leida,
+      deepLinkUrl: notifications.deepLinkUrl,
+      createdAt: notifications.createdAt,
+    })
     .from(notifications)
     .where(eq(notifications.userId, me.sub))
     .orderBy(desc(notifications.createdAt))
@@ -71,9 +79,11 @@ notificationsRouter.post('/subscribe', zValidator('json', subSchema), async (c) 
 });
 
 notificationsRouter.post('/unsubscribe', zValidator('json', z.object({ endpoint: z.string() })), async (c) => {
+  const me = c.get('user');
+  // Solo el dueño puede desactivar su propia suscripción
   await db
     .update(pushSubscriptions)
     .set({ activa: false })
-    .where(eq(pushSubscriptions.endpoint, c.req.valid('json').endpoint));
+    .where(and(eq(pushSubscriptions.endpoint, c.req.valid('json').endpoint), eq(pushSubscriptions.userId, me.sub)));
   return c.json({ ok: true });
 });

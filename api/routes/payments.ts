@@ -32,15 +32,20 @@ paymentsRouter.post('/wompi-webhook', async (c) => {
   if (tx.status === 'APPROVED') newStatus = 'exitoso';
   else if (tx.status === 'DECLINED' || tx.status === 'ERROR' || tx.status === 'VOIDED') newStatus = 'fallido';
 
-  await db
-    .update(payments)
-    .set({ estado: newStatus, updatedAt: new Date() })
-    .where(eq(payments.id, payment.id));
-
-  if (newStatus === 'exitoso') {
-    if (payment.userPlanId) {
-      await db.update(userPlans).set({ estado: 'activo' }).where(eq(userPlans.id, payment.userPlanId));
+  // Atomicidad: estado de pago + activación de plan en una sola transacción.
+  // Si algo falla, no queda un pago 'exitoso' con el plan sin activar (ni viceversa).
+  await db.transaction(async (tx) => {
+    await tx
+      .update(payments)
+      .set({ estado: newStatus, updatedAt: new Date() })
+      .where(eq(payments.id, payment.id));
+    if (newStatus === 'exitoso' && payment.userPlanId) {
+      await tx.update(userPlans).set({ estado: 'activo' }).where(eq(userPlans.id, payment.userPlanId));
     }
+  });
+
+  // Notificaciones fuera de la transacción (I/O de red, best-effort)
+  if (newStatus === 'exitoso') {
     const planRow = payment.userPlanId
       ? await db.select({ nombre: planTypes.nombre, fechaFin: userPlans.fechaFin }).from(userPlans).innerJoin(planTypes, eq(userPlans.planTypeId, planTypes.id)).where(eq(userPlans.id, payment.userPlanId)).limit(1)
       : [];
@@ -67,6 +72,8 @@ paymentsRouter.use('*', requireAuth);
 // Mi historial
 paymentsRouter.get('/me', async (c) => {
   const me = c.get('user');
+  const limit = Math.min(Math.max(Number(c.req.query('limit') ?? 20), 1), 100);
+  const offset = Math.max(Number(c.req.query('offset') ?? 0), 0);
   const rows = await db
     .select({
       id: payments.id,
@@ -80,8 +87,10 @@ paymentsRouter.get('/me', async (c) => {
     })
     .from(payments)
     .where(eq(payments.userId, me.sub))
-    .orderBy(desc(payments.createdAt));
-  return c.json({ payments: rows });
+    .orderBy(desc(payments.createdAt))
+    .limit(limit)
+    .offset(offset);
+  return c.json({ payments: rows, limit, offset });
 });
 
 // Crear intención de pago Wompi (devuelve checkout URL)
@@ -127,33 +136,39 @@ const cashSchema = z.object({
 paymentsRouter.post('/efectivo', requireStaff, zValidator('json', cashSchema), async (c) => {
   const me = c.get('user');
   const body = c.req.valid('json');
-  const [pay] = await db
-    .insert(payments)
-    .values({
-      userId: body.userId,
-      userPlanId: body.userPlanId,
-      montoCop: body.montoCop,
-      metodo: 'efectivo',
-      estado: 'exitoso',
-      notas: body.notas,
-      registradoPor: me.sub,
-    })
-    .returning({ id: payments.id });
 
-  if (body.userPlanId) {
-    await db.update(userPlans).set({ estado: 'activo' }).where(eq(userPlans.id, body.userPlanId));
-  }
+  // Registro de pago + activación de plan de forma atómica
+  const payId = await db.transaction(async (tx) => {
+    const [pay] = await tx
+      .insert(payments)
+      .values({
+        userId: body.userId,
+        userPlanId: body.userPlanId,
+        montoCop: body.montoCop,
+        metodo: 'efectivo',
+        estado: 'exitoso',
+        notas: body.notas,
+        registradoPor: me.sub,
+      })
+      .returning({ id: payments.id });
+    if (body.userPlanId) {
+      await tx.update(userPlans).set({ estado: 'activo' }).where(eq(userPlans.id, body.userPlanId));
+    }
+    return pay.id;
+  });
 
   await notifyUser(body.userId, {
     title: '¡Pago recibido en efectivo! ✅',
     body: `Tu pago de $${body.montoCop.toLocaleString('es-CO')} COP fue registrado por ${me.nombre}.`,
     url: '/app/pagos',
   }, { tipo: 'pago_efectivo' });
-  return c.json({ id: pay.id });
+  return c.json({ id: payId });
 });
 
-// Lista global (admin)
+// Lista global (admin) — paginada
 paymentsRouter.get('/', requireStaff, async (c) => {
+  const limit = Math.min(Math.max(Number(c.req.query('limit') ?? 100), 1), 500);
+  const offset = Math.max(Number(c.req.query('offset') ?? 0), 0);
   const rows = await db
     .select({
       id: payments.id,
@@ -168,6 +183,7 @@ paymentsRouter.get('/', requireStaff, async (c) => {
     .from(payments)
     .innerJoin(users, eq(payments.userId, users.id))
     .orderBy(desc(payments.createdAt))
-    .limit(500);
-  return c.json({ payments: rows });
+    .limit(limit)
+    .offset(offset);
+  return c.json({ payments: rows, limit, offset });
 });

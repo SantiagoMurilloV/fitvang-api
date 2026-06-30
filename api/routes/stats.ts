@@ -61,15 +61,18 @@ statsRouter.get('/me/heatmap', async (c) => {
 // Mi recorrido (timeline)
 statsRouter.get('/me/journey', async (c) => {
   const me = c.get('user');
-  const userRow = await db.select({ createdAt: users.createdAt, nombre: users.nombreCompleto }).from(users).where(eq(users.id, me.sub)).limit(1);
-  const totalAsistencias = await db
-    .select({ n: sql<number>`count(*)::int` })
-    .from(bookings)
-    .where(and(eq(bookings.userId, me.sub), eq(bookings.estado, 'asistio')));
-  const planes = await db
-    .select({ n: sql<number>`count(*)::int` })
-    .from(userPlans)
-    .where(eq(userPlans.userId, me.sub));
+  // Las 3 queries son independientes → en paralelo en vez de secuencial
+  const [userRow, totalAsistencias, planes] = await Promise.all([
+    db.select({ createdAt: users.createdAt, nombre: users.nombreCompleto }).from(users).where(eq(users.id, me.sub)).limit(1),
+    db
+      .select({ n: sql<number>`count(*)::int` })
+      .from(bookings)
+      .where(and(eq(bookings.userId, me.sub), eq(bookings.estado, 'asistio'))),
+    db
+      .select({ n: sql<number>`count(*)::int` })
+      .from(userPlans)
+      .where(eq(userPlans.userId, me.sub)),
+  ]);
   return c.json({
     inicio: userRow[0]?.createdAt ?? null,
     nombre: userRow[0]?.nombre ?? null,
