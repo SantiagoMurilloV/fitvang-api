@@ -263,6 +263,31 @@ usersRouter.post('/:id/reset-password', requireAdmin, async (c) => {
   return c.json({ password: nueva });
 });
 
+// Regenerar el documento de T&C de un usuario que ya aceptó (super_admin).
+// Útil cuando la subida a Cloudinary falló en su momento.
+usersRouter.post('/:id/regenerar-terminos', requireAdmin, async (c) => {
+  const id = c.req.param('id');
+  const [u] = await db
+    .select({ nombre: users.nombreCompleto, documento: users.documento, aceptadoAt: users.terminosAceptadosAt })
+    .from(users)
+    .where(eq(users.id, id))
+    .limit(1);
+  if (!u) return c.json({ error: 'not_found' }, 404);
+  if (!u.aceptadoAt) return c.json({ error: 'no_ha_aceptado' }, 400);
+
+  const fecha = u.aceptadoAt.toLocaleString('es-CO', { timeZone: 'America/Bogota', dateStyle: 'long', timeStyle: 'short' });
+  const html = terminosHtml({ nombre: u.nombre, documento: u.documento, fecha });
+  let url = '';
+  try {
+    url = await uploadRawDoc(`fitvang/terminos/${id}-${Date.now()}`, html);
+  } catch (e) {
+    console.error('[terminos] regeneración falló:', e);
+    return c.json({ error: 'cloudinary_falló', detalle: String((e as Error)?.message ?? e) }, 502);
+  }
+  await db.update(users).set({ terminosDocUrl: url, updatedAt: new Date() }).where(eq(users.id, id));
+  return c.json({ ok: true, url });
+});
+
 // DEACTIVATE (soft)
 usersRouter.delete('/:id', requireAdmin, async (c) => {
   await db.update(users).set({ activo: false }).where(eq(users.id, c.req.param('id')));
