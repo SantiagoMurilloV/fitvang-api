@@ -200,7 +200,8 @@ bookingsRouter.post('/', zValidator('json', createSchema), async (c) => {
 });
 
 // Cancelar reserva
-bookingsRouter.post('/:id/cancel', async (c) => {
+// DELETE = cancelar la reserva (soft: estado 'cancelada' + devuelve cupo + promueve lista)
+bookingsRouter.delete('/:id', async (c) => {
   const me = c.get('user');
   const id = c.req.param('id');
   const rows = await db
@@ -284,4 +285,137 @@ bookingsRouter.post('/:id/cancel', async (c) => {
   }
 
   return c.json({ ok: true, fueraDeVentana });
+});
+
+// PUT = reagendar: mover una reserva a otra sesión (cancela la actual + reserva la
+// nueva de forma atómica). Reglas: la reserva actual debe estar a ≥1h y la nueva
+// sesión pasa las mismas validaciones que una reserva normal.
+const rescheduleSchema = z.object({ newSessionId: z.string().uuid() });
+bookingsRouter.put('/:id', zValidator('json', rescheduleSchema), async (c) => {
+  const me = c.get('user');
+  const id = c.req.param('id');
+  const { newSessionId } = c.req.valid('json');
+
+  // 1. Reserva actual
+  const oldRows = await db
+    .select({
+      booking: bookings,
+      fecha: classSessions.fecha,
+      horaInicio: classTemplates.horaInicio,
+      sessionId: classSessions.id,
+    })
+    .from(bookings)
+    .innerJoin(classSessions, eq(bookings.sessionId, classSessions.id))
+    .innerJoin(classTemplates, eq(classSessions.templateId, classTemplates.id))
+    .where(eq(bookings.id, id))
+    .limit(1);
+  const old = oldRows[0];
+  if (!old) return c.json({ error: 'not_found' }, 404);
+  if (old.booking.userId !== me.sub && me.rol === 'user') return c.json({ error: 'forbidden' }, 403);
+  if (old.booking.estado !== 'activa') return c.json({ error: 'reserva_no_activa' }, 400);
+  if (newSessionId === old.sessionId) return c.json({ error: 'misma_sesion' }, 400);
+
+  // La reserva actual debe poder modificarse con ≥1h de anticipación
+  const oldStart = new Date(`${old.fecha}T${old.horaInicio}-05:00`);
+  if ((oldStart.getTime() - Date.now()) / 36e5 < 1) {
+    return c.json({ error: 'muy_tarde_para_editar', message: 'Solo puedes reagendar con al menos 1 hora de anticipación.' }, 400);
+  }
+
+  // 2. Plan activo + acceso
+  const planRows = await db
+    .select({
+      userPlanId: userPlans.id,
+      trainingTypeId: planTypes.trainingTypeId,
+      accesoMulti: trainingTypes.accesoMulti,
+    })
+    .from(userPlans)
+    .innerJoin(planTypes, eq(userPlans.planTypeId, planTypes.id))
+    .innerJoin(trainingTypes, eq(planTypes.trainingTypeId, trainingTypes.id))
+    .where(and(eq(userPlans.userId, old.booking.userId), eq(userPlans.estado, 'activo')))
+    .limit(1);
+  const plan = planRows[0];
+  if (!plan) return c.json({ error: 'sin_plan_activo' }, 403);
+
+  // 3. Nueva sesión
+  const sessRows = await db
+    .select({
+      id: classSessions.id,
+      estado: classSessions.estado,
+      fecha: classSessions.fecha,
+      horaInicio: classTemplates.horaInicio,
+      trainingTypeId: classTemplates.trainingTypeId,
+      trainingSlug: trainingTypes.slug,
+      capacidadMax: classTemplates.capacidadMax,
+      ocupados: sql<number>`COALESCE((SELECT COUNT(*)::int FROM ${bookings} b WHERE b.session_id = ${classSessions.id} AND b.estado IN ('activa','asistio'))::int, 0)`,
+    })
+    .from(classSessions)
+    .innerJoin(classTemplates, eq(classSessions.templateId, classTemplates.id))
+    .innerJoin(trainingTypes, eq(classTemplates.trainingTypeId, trainingTypes.id))
+    .where(eq(classSessions.id, newSessionId))
+    .limit(1);
+  const sess = sessRows[0];
+  if (!sess) return c.json({ error: 'sesion_no_encontrada' }, 404);
+  if (sess.estado !== 'programada') return c.json({ error: 'sesion_no_disponible' }, 400);
+  if (sess.trainingSlug === 'kids') return c.json({ error: 'kids_solo_por_admin' }, 403);
+  if (!plan.accesoMulti && plan.trainingTypeId !== sess.trainingTypeId) {
+    return c.json({ error: 'plan_no_cubre_training' }, 403);
+  }
+
+  const nowBog = toZonedTime(new Date(), TZ_BOG);
+  const hourBog = nowBog.getHours();
+  if (hourBog >= 23 || hourBog < 6) {
+    return c.json({ error: 'horario_restringido', message: 'No puedes reservar entre las 11 PM y las 6 AM.' }, 400);
+  }
+  const newStart = parseISO(`${sess.fecha}T${sess.horaInicio}`);
+  if (differenceInMinutes(newStart, nowBog) < 30) {
+    return c.json({ error: 'muy_tarde_para_reservar', message: 'La nueva clase debe ser con al menos 30 minutos de anticipación.' }, 400);
+  }
+
+  const dup = await db
+    .select({ id: bookings.id })
+    .from(bookings)
+    .where(and(eq(bookings.userId, old.booking.userId), eq(bookings.sessionId, newSessionId), inArray(bookings.estado, ['activa', 'asistio'])))
+    .limit(1);
+  if (dup[0]) return c.json({ error: 'ya_reservada' }, 409);
+
+  if (sess.ocupados >= sess.capacidadMax) return c.json({ error: 'sesion_llena', message: 'La clase elegida está llena.' }, 400);
+
+  // 4. Swap atómico: el cupo es el mismo, así que no se toca el conteo del plan.
+  let promovido: string | null = null;
+  await db.transaction(async (tx) => {
+    // Cancelar la reserva actual
+    await tx
+      .update(bookings)
+      .set({ estado: 'cancelada', canceladaPor: 'usuario', canceladaAt: new Date() })
+      .where(eq(bookings.id, id));
+
+    // Promover al primero de la lista de espera de la sesión liberada
+    const wl = await tx.select().from(waitlist).where(eq(waitlist.sessionId, old.sessionId)).orderBy(waitlist.posicion).limit(1);
+    if (wl[0]) {
+      await tx.delete(waitlist).where(eq(waitlist.id, wl[0].id));
+      await tx.update(waitlist).set({ posicion: sql`${waitlist.posicion} - 1` }).where(and(eq(waitlist.sessionId, old.sessionId), gt(waitlist.posicion, wl[0].posicion)));
+      await tx
+        .insert(bookings)
+        .values({ userId: wl[0].userId, sessionId: old.sessionId, estado: 'activa' })
+        .onConflictDoUpdate({ target: [bookings.userId, bookings.sessionId], set: { estado: 'activa', canceladaPor: null, canceladaAt: null, fechaReserva: new Date() } });
+      await tx.update(userPlans).set({ sesionesUsadas: sql`${userPlans.sesionesUsadas} + 1` }).where(and(eq(userPlans.userId, wl[0].userId), eq(userPlans.estado, 'activo')));
+      promovido = wl[0].userId;
+    }
+
+    // Activar la reserva en la nueva sesión (reactiva si existía cancelada)
+    await tx
+      .insert(bookings)
+      .values({ userId: old.booking.userId, sessionId: newSessionId, estado: 'activa' })
+      .onConflictDoUpdate({ target: [bookings.userId, bookings.sessionId], set: { estado: 'activa', canceladaPor: null, canceladaAt: null, fechaReserva: new Date() } });
+  });
+
+  if (promovido) {
+    notifyUser(promovido, {
+      title: 'Hay un cupo para tu clase',
+      body: 'Pasaste de la lista de espera a confirmado.',
+      url: '/app/horarios',
+    }, { tipo: 'reserva' }).catch(() => {});
+  }
+
+  return c.json({ ok: true });
 });
