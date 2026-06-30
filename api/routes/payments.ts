@@ -169,6 +169,7 @@ paymentsRouter.post('/efectivo', requireStaff, zValidator('json', cashSchema), a
 paymentsRouter.get('/', requireStaff, async (c) => {
   const limit = Math.min(Math.max(Number(c.req.query('limit') ?? 100), 1), 500);
   const offset = Math.max(Number(c.req.query('offset') ?? 0), 0);
+  const userId = c.req.query('userId');
   const rows = await db
     .select({
       id: payments.id,
@@ -182,6 +183,7 @@ paymentsRouter.get('/', requireStaff, async (c) => {
     })
     .from(payments)
     .innerJoin(users, eq(payments.userId, users.id))
+    .where(userId ? eq(payments.userId, userId) : undefined)
     .orderBy(desc(payments.createdAt))
     .limit(limit)
     .offset(offset);

@@ -47,7 +47,7 @@ statsRouter.get('/me/heatmap', async (c) => {
     .where(and(
       eq(bookings.userId, me.sub),
       eq(bookings.estado, 'asistio'),
-      gte(classSessions.fecha, sql`(CURRENT_DATE - ${days}::int)::date::text`),
+      gte(classSessions.fecha, sql`(CURRENT_DATE - ${days}::int)::date`),
     ));
 
   // Agrupar por fecha: { 'yyyy-MM-dd': count }
@@ -79,6 +79,38 @@ statsRouter.get('/me/journey', async (c) => {
     asistencias: totalAsistencias[0]?.n ?? 0,
     planes: planes[0]?.n ?? 0,
   });
+});
+
+// Roster de estudiantes (miembros + niños, sin acudientes) con su scoring.
+// Para el panel de "Progreso de estudiantes" del admin/coach.
+statsRouter.get('/students', requireStaff, async (c) => {
+  const roster = await db
+    .select({
+      id: users.id,
+      nombre: users.nombreCompleto,
+      avatarUrl: users.avatarUrl,
+      esMenor: users.esMenor,
+    })
+    .from(users)
+    .where(and(eq(users.rol, 'user'), eq(users.esAcudiente, false), eq(users.activo, true)))
+    .orderBy(users.nombreCompleto);
+
+  // Scoring por usuario (2 queries c/u). El club es pequeño; si crece, cachear.
+  const students = await Promise.all(
+    roster.map(async (u) => {
+      const s = await computeUserScoring(u.id);
+      return {
+        ...u,
+        rachaActual: s.rachaActual,
+        rachaMaxima: s.rachaMaxima,
+        asistencias: s.asistencias,
+        totalSesiones: s.totalSesiones,
+        porcentaje: s.porcentaje,
+        nivel: s.nivel,
+      };
+    }),
+  );
+  return c.json({ students });
 });
 
 // Dashboard admin KPIs

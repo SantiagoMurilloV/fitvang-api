@@ -355,6 +355,23 @@ export const notifications = pgTable(
   })
 );
 
+// Historial de mensajes que el super_admin reutiliza al enviar notificaciones.
+// Se autoguarda al hacer broadcast (upsert por titulo+mensaje) y puede borrarse.
+export const notificationTemplates = pgTable(
+  'notification_templates',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    titulo: varchar('titulo', { length: 200 }).notNull(),
+    mensaje: text('mensaje').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniqMsg: uniqueIndex('notification_templates_unico_idx').on(t.titulo, t.mensaje),
+    updatedIdx: index('notification_templates_updated_idx').on(t.updatedAt),
+  })
+);
+
 export const waitlist = pgTable(
   'waitlist',
   {

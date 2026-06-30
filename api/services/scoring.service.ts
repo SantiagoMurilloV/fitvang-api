@@ -181,7 +181,7 @@ export async function computeUserScoring(userId: string, mes?: string): Promise<
     .where(and(
       eq(bookings.userId, userId),
       eq(bookings.estado, 'asistio'),
-      gte(classSessions.fecha, sql`(CURRENT_DATE - 370)::date::text`),
+      gte(classSessions.fecha, sql`(CURRENT_DATE - 370)::date`),
     ));
 
   const attendedDays = allAttended.map((r) => r.fecha);
