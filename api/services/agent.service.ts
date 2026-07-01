@@ -46,11 +46,48 @@ const ADMIN_TOOLS = [
   { type: 'function', function: { name: 'reservas_por_fecha', description: 'Quiénes están reservados en una fecha (y opcionalmente una hora). Devuelve nombres.', parameters: { type: 'object', properties: { fecha: { type: 'string', description: 'YYYY-MM-DD' }, hora: { type: 'string', description: 'HH:MM opcional' } }, required: ['fecha'] } } },
   { type: 'function', function: { name: 'pagos_estado', description: 'Pagos por estado (pendiente/exitoso). Devuelve quién pagó o quién debe, con montos.', parameters: { type: 'object', properties: { estado: { type: 'string', enum: ['pendiente', 'exitoso', 'fallido'] } }, required: ['estado'] } } },
   { type: 'function', function: { name: 'resumen_financiero', description: 'Resumen financiero de un mes: ingresos confirmados, pendientes y conteos.', parameters: { type: 'object', properties: { mes: { type: 'string', description: 'YYYY-MM (por defecto el mes actual)' } } } } },
-  { type: 'function', function: { name: 'enviar_notificacion', description: 'Envía una notificación push a todos los miembros activos del club.', parameters: { type: 'object', properties: { titulo: { type: 'string' }, mensaje: { type: 'string' } }, required: ['titulo', 'mensaje'] } } },
+  { type: 'function', function: { name: 'preparar_notificacion', description: 'Prepara un BORRADOR de notificación push y calcula a cuántos/quiénes llegaría. NO envía nada. Úsala SIEMPRE antes de enviar, para mostrarle el borrador al admin y que confirme.', parameters: { type: 'object', properties: { titulo: { type: 'string' }, mensaje: { type: 'string' }, audiencia: { type: 'string', enum: ['todos', 'usuarios'], description: "'todos' = todos los miembros activos; 'usuarios' = solo los usuarioIds indicados" }, usuarioIds: { type: 'array', items: { type: 'string' }, description: 'IDs de usuarios (de buscar_usuario) cuando audiencia="usuarios"' } }, required: ['titulo', 'mensaje', 'audiencia'] } } },
+  { type: 'function', function: { name: 'enviar_notificacion', description: 'Envía la notificación push. SOLO úsala DESPUÉS de haber mostrado el borrador con preparar_notificacion y de que el admin confirme explícitamente el envío en un mensaje. Usa el mismo titulo, mensaje y audiencia del borrador.', parameters: { type: 'object', properties: { titulo: { type: 'string' }, mensaje: { type: 'string' }, audiencia: { type: 'string', enum: ['todos', 'usuarios'] }, usuarioIds: { type: 'array', items: { type: 'string' } } }, required: ['titulo', 'mensaje', 'audiencia'] } } },
   { type: 'function', function: { name: 'buscar_usuario', description: 'Busca usuarios por nombre parcial o aproximado. Devuelve id y nombre. Úsalo ANTES de pedir el detalle de un usuario.', parameters: { type: 'object', properties: { nombre: { type: 'string' } }, required: ['nombre'] } } },
   { type: 'function', function: { name: 'detalle_usuario', description: 'Datos de un usuario por su id: planes activos, scoring, próximas reservas y últimos pagos.', parameters: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } } },
   { type: 'function', function: { name: 'usuarios_inactivos', description: 'Miembros que no han asistido en los últimos N días (default 30), con su última asistencia.', parameters: { type: 'object', properties: { dias: { type: 'number' } } } } },
 ];
+
+// Resuelve los destinatarios de una notificación según la audiencia pedida.
+// 'todos' = miembros activos con rol user; 'usuarios' = solo los IDs indicados.
+async function resolveDestinatarios(
+  args: any,
+): Promise<{ audiencia: 'todos' | 'usuarios'; rows: { id: string; nombre: string }[]; error?: string }> {
+  const audiencia: 'todos' | 'usuarios' = args?.audiencia === 'usuarios' ? 'usuarios' : 'todos';
+  if (audiencia === 'usuarios') {
+    const ids = Array.isArray(args?.usuarioIds) ? args.usuarioIds.map(String).filter(Boolean) : [];
+    if (ids.length === 0) return { audiencia, rows: [], error: 'Falta indicar a qué usuarios va dirigida (usa buscar_usuario para obtener sus IDs).' };
+    const rows = await db
+      .select({ id: users.id, nombre: users.nombreCompleto })
+      .from(users)
+      .where(and(eq(users.activo, true), inArray(users.id, ids)));
+    return { audiencia, rows };
+  }
+  const rows = await db
+    .select({ id: users.id, nombre: users.nombreCompleto })
+    .from(users)
+    .where(and(eq(users.rol, 'user'), eq(users.activo, true)));
+  return { audiencia, rows };
+}
+
+// Candado anti-envío-prematuro: solo autoriza enviar_notificacion si el texto del
+// mensaje ya se mostró en un mensaje del asistente en un turno ANTERIOR (el borrador
+// ya se le presentó al admin y este respondió). Bloquea enviar sin borrador previo o
+// en el mismo turno en que se prepara.
+function borradorYaConfirmado(history: ChatMessage[], args: any): boolean {
+  const mensaje = String(args?.mensaje ?? '').trim();
+  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+  const target = norm(mensaje);
+  if (target.length < 3) return false;
+  return history.some(
+    (m) => m.role === 'assistant' && typeof m.content === 'string' && norm(m.content).includes(target),
+  );
+}
 
 // ── Ejecución de tools ──────────────────────────────────────────────────────
 async function execTool(name: string, args: any, u: AgentUser): Promise<unknown> {
@@ -152,13 +189,36 @@ async function execTool(name: string, args: any, u: AgentUser): Promise<unknown>
         .where(eq(payments.estado, 'pendiente'));
       return { mes, ingresosConfirmados: Number(ingresos?.total ?? 0), pagosConfirmados: ingresos?.n ?? 0, totalPendiente: Number(pendientes?.total ?? 0), pagosPendientes: pendientes?.n ?? 0 };
     }
+    case 'preparar_notificacion': {
+      if (!isAdmin) return 'No autorizado.';
+      const titulo = String(args.titulo ?? '').trim();
+      const mensaje = String(args.mensaje ?? '').trim();
+      if (!titulo || !mensaje) return 'Faltan el título o el mensaje de la notificación.';
+      const dest = await resolveDestinatarios(args);
+      if (dest.error) return dest.error;
+      if (dest.rows.length === 0) return 'No hay destinatarios que coincidan; revisa la audiencia.';
+      return {
+        estado: 'BORRADOR — todavía NO enviado',
+        titulo,
+        mensaje,
+        audiencia: dest.audiencia === 'todos' ? 'Todos los miembros activos' : 'Usuarios seleccionados',
+        totalDestinatarios: dest.rows.length,
+        nombres: dest.audiencia === 'usuarios' ? dest.rows.map((r) => r.nombre) : undefined,
+        instruccion: 'Muéstrale al admin este borrador (título, el texto EXACTO del mensaje y a cuántos/quiénes llega) y pregúntale si desea enviarlo. NO llames enviar_notificacion en este mismo turno: espera la confirmación del admin.',
+      };
+    }
     case 'enviar_notificacion': {
       if (!isAdmin) return 'No autorizado.';
-      const rows = await db.select({ id: users.id }).from(users).where(and(eq(users.rol, 'user'), eq(users.activo, true)));
-      for (const r of rows) {
-        await notifyUser(r.id, { title: String(args.titulo), body: String(args.mensaje), url: '/app' }, { tipo: 'sistema' }).catch(() => {});
+      const titulo = String(args.titulo ?? '').trim();
+      const mensaje = String(args.mensaje ?? '').trim();
+      if (!titulo || !mensaje) return 'Faltan el título o el mensaje de la notificación.';
+      const dest = await resolveDestinatarios(args);
+      if (dest.error) return dest.error;
+      if (dest.rows.length === 0) return 'No hay destinatarios que coincidan; no se envió nada.';
+      for (const r of dest.rows) {
+        await notifyUser(r.id, { title: titulo, body: mensaje, url: '/app' }, { tipo: 'sistema' }).catch(() => {});
       }
-      return `Notificación enviada a ${rows.length} miembro(s).`;
+      return `Notificación enviada a ${dest.rows.length} miembro(s).`;
     }
     case 'buscar_usuario': {
       if (!isAdmin) return 'No autorizado.';
@@ -245,8 +305,14 @@ ${FITVANG_RULES}`;
 ADMINISTRADOR: ${u.nombre}. Tienes acceso a toda la data del club.
 - Para preguntas sobre un usuario por nombre/apodo: usa SIEMPRE buscar_usuario primero (búsqueda parcial) y luego detalle_usuario con el id que devuelva, antes de responder.
 - Puedes responder quién está reservado en una fecha/hora (con nombres completos), quién pagó o debe, resúmenes financieros y quién lleva días sin reservar.
-- Cuando te pidan enviar una notificación, confirma el contenido y usa enviar_notificacion.
 - Lista los nombres completos individualmente, no solo conteos.
+
+ENVÍO DE NOTIFICACIONES — protocolo OBLIGATORIO, síguelo paso a paso y NUNCA lo saltes:
+1. Cuando el admin quiera enviar una notificación, primero REÚNE lo necesario preguntando lo que falte: el TÍTULO, el MENSAJE y a QUIÉN va dirigida (a todos los miembros activos, o a usuarios específicos). Nunca asumas la audiencia ni el contenido: si no te lo dieron, pregúntalo. Para usuarios específicos, usa buscar_usuario para obtener sus IDs.
+2. Cuando tengas título, mensaje y audiencia, llama a preparar_notificacion (esto NO envía). Luego muéstrale al admin el BORRADOR completo: el título, el texto EXACTO del mensaje y a cuántos/quiénes llegaría. Termina SIEMPRE preguntándole si desea enviarla.
+3. NO envíes en ese mismo turno. Detente y espera la respuesta del admin.
+4. Solo si el admin CONFIRMA explícitamente el envío (ej. "sí, envíala"), llama a enviar_notificacion con el mismo título, mensaje y audiencia del borrador. Si pide cambios, ajústalos y vuelve a mostrar el borrador (paso 2).
+5. Regla absoluta: jamás llames enviar_notificacion sin haber mostrado antes el borrador y recibido una confirmación explícita del admin.
 
 ${FITVANG_RULES}`;
 }
@@ -337,8 +403,13 @@ export async function runAgent(
       try { args = JSON.parse(call.function?.arguments || '{}'); } catch { args = {}; }
       await onTool?.(call.function?.name);
       let result: unknown;
-      try { result = await execTool(call.function?.name, args, u); }
-      catch (e) { result = `Error ejecutando la herramienta: ${String(e)}`; }
+      if (call.function?.name === 'enviar_notificacion' && !borradorYaConfirmado(history, args)) {
+        // El admin aún no confirmó el borrador en un turno previo → no enviar.
+        result = 'No se envió nada. Antes de enviar debes preparar el borrador con preparar_notificacion, mostrárselo al admin y esperar a que confirme el envío en su siguiente mensaje. Muéstrale el borrador ahora y pregúntale si desea enviarlo.';
+      } else {
+        try { result = await execTool(call.function?.name, args, u); }
+        catch (e) { result = `Error ejecutando la herramienta: ${String(e)}`; }
+      }
       messages.push({ role: 'tool', tool_call_id: call.id, name: call.function?.name, content: typeof result === 'string' ? result : JSON.stringify(result) });
     }
   }
