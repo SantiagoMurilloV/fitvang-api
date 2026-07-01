@@ -14,7 +14,20 @@ export const TERMINOS_SECCIONES: { titulo: string; texto: string }[] = [
   { titulo: '8. Vigencia y cambios', texto: 'Estos términos pueden actualizarse. El uso continuado del servicio implica la aceptación de la versión vigente.' },
 ];
 
+/** Escapa caracteres HTML para que un nombre/documento no pueda romper el layout ni inyectar markup. */
+function esc(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 export function terminosHtml(p: { nombre: string; documento: string; fecha: string }): string {
+  const nombre = esc(p.nombre);
+  const documento = esc(p.documento);
+  const fecha = esc(p.fecha);
   const secciones = TERMINOS_SECCIONES.map(
     (s) => `<section><h2>${s.titulo}</h2><p>${s.texto}</p></section>`,
   ).join('\n');
@@ -32,14 +45,14 @@ export function terminosHtml(p: { nombre: string; documento: string; fecha: stri
 <h1>Términos y Condiciones — Fitvang</h1>
 <div class="meta">Versión ${TERMINOS_VERSION}</div>
 <div class="meta">
-  <strong>Aceptado por:</strong> ${p.nombre}<br/>
-  <strong>Documento:</strong> ${p.documento}<br/>
-  <strong>Fecha de aceptación:</strong> ${p.fecha}
+  <strong>Aceptado por:</strong> ${nombre}<br/>
+  <strong>Documento:</strong> ${documento}<br/>
+  <strong>Fecha de aceptación:</strong> ${fecha}
 </div>
 ${secciones}
 <div class="firma">
-  Este documento certifica que <strong>${p.nombre}</strong> (documento ${p.documento}) aceptó
-  los Términos y Condiciones de Fitvang el ${p.fecha} a través de la aplicación.
+  Este documento certifica que <strong>${nombre}</strong> (documento ${documento}) aceptó
+  los Términos y Condiciones de Fitvang el ${fecha} a través de la aplicación.
 </div>
 </body></html>`;
 }

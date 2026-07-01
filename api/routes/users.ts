@@ -9,6 +9,7 @@ import { requireAuth } from '../middleware/jwt';
 import { requireAdmin, requireStaff, checkSelf } from '../middleware/rbac';
 import { notifyUser } from '../services/webpush.service';
 import { uploadRawDoc } from '../lib/cloudinary';
+import { fetchWithTimeout } from '../lib/http';
 import { terminosHtml, TERMINOS_SECCIONES, TERMINOS_VERSION } from '../lib/terminos';
 
 export const usersRouter = new Hono();
@@ -291,6 +292,44 @@ usersRouter.post('/:id/regenerar-terminos', requireAdmin, async (c) => {
   }
   await db.update(users).set({ terminosDocUrl: url, updatedAt: new Date() }).where(eq(users.id, id));
   return c.json({ ok: true, url });
+});
+
+// Documento de T&C de un usuario, para el visor en la app (super_admin).
+// Devuelve el HTML del documento firmado: primero intenta la copia archivada en
+// Cloudinary (el documento exacto que aceptó); si no está o falla, lo regenera al
+// vuelo desde los datos del usuario. Nunca guarda el HTML en la BD.
+usersRouter.get('/:id/terminos-doc', requireAdmin, async (c) => {
+  const id = c.req.param('id');
+  const [u] = await db
+    .select({
+      nombre: users.nombreCompleto,
+      documento: users.documento,
+      aceptadoAt: users.terminosAceptadosAt,
+      docUrl: users.terminosDocUrl,
+    })
+    .from(users)
+    .where(eq(users.id, id))
+    .limit(1);
+  if (!u) return c.json({ error: 'not_found' }, 404);
+  if (!u.aceptadoAt) return c.json({ error: 'no_ha_aceptado' }, 400);
+
+  // 1) Copia archivada en Cloudinary (documento exacto firmado)
+  if (u.docUrl) {
+    try {
+      const res = await fetchWithTimeout(u.docUrl, {}, 8_000);
+      if (res.ok) {
+        const html = await res.text();
+        if (html.trim()) return c.json({ html, fuente: 'cloudinary' });
+      }
+    } catch (e) {
+      console.warn('[terminos-doc] fallo leyendo Cloudinary, regenero:', e);
+    }
+  }
+
+  // 2) Respaldo: regenerar al vuelo desde los datos del usuario
+  const fecha = u.aceptadoAt.toLocaleString('es-CO', { timeZone: 'America/Bogota', dateStyle: 'long', timeStyle: 'short' });
+  const html = terminosHtml({ nombre: u.nombre, documento: u.documento, fecha });
+  return c.json({ html, fuente: 'generado' });
 });
 
 // DEACTIVATE (soft)
