@@ -61,6 +61,7 @@ export const users = pgTable(
     documento: varchar('documento', { length: 40 }).notNull(),
     email: varchar('email', { length: 200 }).notNull(),
     telefono: varchar('telefono', { length: 40 }),
+    eps: varchar('eps', { length: 100 }),
     passwordHash: text('password_hash').notNull(),
     // Copia en claro de la contraseña, visible solo para super_admin (decisión del dueño).
     // OJO: riesgo de seguridad si la BD se filtra. Se rellena al crear/editar/restablecer.
